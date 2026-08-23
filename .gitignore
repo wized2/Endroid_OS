@@ -1,5 +1,32 @@
-node_modules/
-.next/
-dist/
+```
+# Build artifacts
 build/
+dist/
+target/
+
+# Dependencies
+Cargo.lock
+vendor/
+
+# Logs and temp files
 *.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust/Cargo
+**/target/
+Cargo.lock
+```node_modules/
+.next/

@@ -1,0 +1,6 @@
+config BR2_PACKAGE_ENDROIDD
+	bool "endroidd"
+	help
+	  Endroid OS hardware bridge daemon.
+	  Provides REST API for system info, preferences, network,
+	  power/battery, and app management.

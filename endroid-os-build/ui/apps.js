@@ -1,0 +1,1888 @@
+lucide.createIcons();
+const LUCIDE_NAMES = new Set();
+(function buildLucideNames(){
+  if(window.lucide && lucide.icons){
+    Object.keys(lucide.icons).forEach(k=>{
+      const kebab = k.replace(/([a-z0-9])([A-Z])/g,'$1-$2').replace(/([A-Z]+)([A-Z][a-z])/g,'$1-$2').toLowerCase();
+      LUCIDE_NAMES.add(kebab);
+    });
+  }
+})();
+function resolveIconName(name){
+  if(!name) return 'app-window';
+  return LUCIDE_NAMES.has(name) ? name : 'app-window';
+}
+function normalizeSvg(svg){
+  return svg.replace(/<svg([^>]*)>/i, (m, attrs)=>{
+    let a = attrs.replace(/\s(width|height)="[^"]*"/gi,'');
+    return `<svg${a} width="100%" height="100%">`;
+  });
+}
+function iconMarkup(app){
+  if(app.svg) return `<span style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;">${normalizeSvg(app.svg)}</span>`;
+  return `<i data-lucide="${app.icon}"></i>`;
+}
+const IDB_NAME = 'endroid_epk_store', IDB_STORE = 'epks';
+function idbOpen(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbPut(key, blob){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(blob, key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function idbGet(key){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbDelete(key){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+const META_KEY = 'endroid_installed_apps_meta';
+function loadInstalledMeta(){
+  try{ return JSON.parse(localStorage.getItem(META_KEY)) || []; }catch(e){ return []; }
+}
+function saveInstalledMeta(meta){ localStorage.setItem(META_KEY, JSON.stringify(meta)); }
+function addInstalledMeta(entry){
+  const meta = loadInstalledMeta();
+  meta.push(entry);
+  saveInstalledMeta(meta);
+}
+function removeInstalledMeta(key){
+  saveInstalledMeta(loadInstalledMeta().filter(m=>m.key!==key));
+  idbDelete(key).catch(()=>{});
+}
+async function hydrateInstalledApps(){
+  const meta = loadInstalledMeta();
+  for(const m of meta){
+    try{
+      if(m.type==='store'){
+        const app = (window.APP_STORE_CATALOG||[]).find(a=>a.id===m.storeId);
+        if(!app) continue;
+        APPS[m.key] = { name: app.name, icon: app.icon, pinned:false, render: app.render };
+        installedApps.push({name: app.name, version:'1.0.0', icon: app.icon, appKey: m.key});
+      } else if(m.type==='web'){
+        APPS[m.key] = { name: m.name, icon: m.icon, svg: m.svg, pinned:false, render:(b)=>renderWebApp(b, m.url) };
+        installedApps.push({name: m.name, url: m.url, icon: m.icon, svg: m.svg, appKey: m.key});
+      } else if(m.type==='epk'){
+        const blob = await idbGet(m.key);
+        if(!blob) continue;
+        const zip = await JSZip.loadAsync(blob);
+        await registerEpkFromZip(zip, m.manifest, m.key, false);
+      }
+    }catch(e){ console.warn('Failed to hydrate app', m, e); }
+  }
+  rebuildLauncherAndPins();
+}
+const APPS = {
+  files:     { name:"File Manager", icon:"folder",        pinned:true,  render: renderFiles },
+  browser:   { name:"Browser",      icon:"compass",        pinned:true,  render: renderBrowser },
+  notes:     { name:"Notes",        icon:"sticky-note",    pinned:true,  render: renderNotes },
+  calc:      { name:"Calculator",   icon:"calculator",     pinned:true,  render: renderCalc },
+  installer: { name:"App Installer",icon:"package-plus",   pinned:false, render: renderInstaller },
+  terminal:  { name:"Terminal",     icon:"square-terminal",pinned:true,  render: renderTerminal },
+  weather:   { name:"Weather",      icon:"cloud-sun",      pinned:true,  render: renderWeather },
+  facts:     { name:"Useless Facts",icon:"sparkles",       pinned:false, render: renderFacts },
+  currency:  { name:"Currency",     icon:"banknote",       pinned:false, render: renderCurrency },
+  password:  { name:"Password Gen", icon:"key-round",      pinned:false, render: renderPassword },
+  qr:        { name:"QR Code",      icon:"qr-code",        pinned:false, render: renderQR },
+  units:     { name:"Unit Converter",icon:"ruler",         pinned:false, render: renderUnits },
+  gallery:   { name:"Gallery",      icon:"image",          pinned:false, render: renderGallery },
+  music:     { name:"Music",        icon:"music",          pinned:true,  render: renderMusic },
+  calendar:  { name:"Calendar",     icon:"calendar-days",  pinned:true,  render: renderCalendar },
+  contacts:  { name:"Contacts",     icon:"contact-round",  pinned:false, render: renderContacts },
+  settings:  { name:"Settings",     icon:"settings",       pinned:false, render: renderSettings },
+};
+let zTop = 10;
+const openWindows = {};
+let winCount = 0;
+const KERNEL_LINES = [
+  "[    0.000000] Linux version 6.9.0-endroid (endroid@build) (gcc 13.2.0) #1 SMP PREEMPT",
+  "[    0.000000] Command line: root=/dev/ram0 rw console=tty0 quiet endroid.web=1",
+  "[    0.000412] BIOS-provided physical RAM map:",
+  "[    0.000891] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'",
+  "[    0.014223] ACPI: Core revision 20230628",
+  "[    0.041231] Endroid: initializing web-native syscall shim…",
+  "[    0.052004] endroid_vfs: mounted virtual filesystem on /",
+  "[    0.061882] endroid_wm: window manager kernel module loaded",
+  "[    0.073115] PCI: Using ACPI for IRQ routing",
+  "[    0.089432] tsc: Refined TSC clocksource calibration",
+  "[    0.102657] clocksource: tsc: mask: 0xffffffffffffffff",
+  "[    0.118834] Endroid: local API server bound to loopback",
+  "[    0.134201] EXT4-fs (ram0): mounted filesystem with ordered data mode",
+  "[    0.151903] endroid_gfx: WebGL compositor ready",
+  "[    0.168220] audio: WebAudio backend registered",
+  "[    0.183441] net: registering fetch()-based network stack",
+  "[    0.201009] Endroid: entering userspace…",
+];
+function runKernelBoot(cb){
+  const kb = document.getElementById('kernel-boot');
+  const linesEl = document.getElementById('kernel-lines');
+  let i = 0;
+  const iv = setInterval(()=>{
+    if(i >= KERNEL_LINES.length){
+      clearInterval(iv);
+      setTimeout(()=>{
+        kb.style.transition = 'opacity .35s ease';
+        kb.style.opacity = '0';
+        setTimeout(()=>{ kb.style.display='none'; cb(); }, 360);
+      }, 260);
+      return;
+    }
+    const line = document.createElement('div');
+    line.textContent = KERNEL_LINES[i];
+    linesEl.appendChild(line);
+    i++;
+  }, 85);
+}
+const bootLogs = [
+  "initializing kernel…",
+  "mounting root filesystem…",
+  "starting local API server…",
+  "loading window manager…",
+  "starting desktop shell…",
+  "ready."
+];
+function startFriendlyBoot(){
+  let bStep = 0;
+  const bootFill = document.getElementById('boot-fill');
+  const bootLog = document.getElementById('boot-log');
+  const bootInterval = setInterval(()=>{
+    bStep++;
+    bootFill.style.width = Math.min(100, (bStep/bootLogs.length)*100) + '%';
+    bootLog.textContent = bootLogs[Math.min(bStep, bootLogs.length-1)];
+    if(bStep >= bootLogs.length){
+      clearInterval(bootInterval);
+      setTimeout(()=>{
+        document.getElementById('boot').classList.add('hide');
+        document.getElementById('desktop').classList.add('active');
+        setTimeout(()=>{document.getElementById('boot').style.display='none';}, 650);
+        pushNotif('system','box','Welcome to Endroid OS','System booted successfully in 6.2s');
+        hydrateInstalledApps();
+      }, 350);
+    }
+  }, 260);
+}
+runKernelBoot(startFriendlyBoot);
+function tickClock(){
+  const d = new Date();
+  document.getElementById('clock-time').textContent = d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  document.getElementById('clock-date').textContent = d.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'});
+}
+tickClock(); setInterval(tickClock, 1000*15);
+const desktopIconKeys = ['files','browser','notes','terminal','weather'];
+const diLayer = document.getElementById('desktop-icons');
+desktopIconKeys.forEach(k=>{
+  const app = APPS[k];
+  const el = document.createElement('div');
+  el.className='d-icon';
+  el.innerHTML = `<div class="ico">${iconMarkup(app)}</div><span>${app.name}</span>`;
+  el.ondblclick = ()=>openApp(k);
+  el.onclick = (e)=>{e.stopPropagation();};
+  diLayer.appendChild(el);
+});
+const pinnedLayer = document.getElementById('pinned-apps');
+Object.entries(APPS).filter(([k,a])=>a.pinned).forEach(([k,a])=>{
+  const b = document.createElement('button');
+  b.className='taskbar-app';
+  b.innerHTML = iconMarkup(a);
+  b.title = a.name;
+  b.onclick = ()=>toggleApp(k);
+  b.dataset.app = k;
+  pinnedLayer.appendChild(b);
+});
+const launcherGrid = document.getElementById('launcher-grid');
+function buildLauncher(filter=''){
+  launcherGrid.innerHTML='';
+  Object.entries(APPS).filter(([k,a])=>a.name.toLowerCase().includes(filter.toLowerCase())).forEach(([k,a])=>{
+    const el = document.createElement('div');
+    el.className='l-app';
+    el.innerHTML = `<div class="ico">${iconMarkup(a)}</div><span>${a.name}</span>`;
+    el.onclick = ()=>{ openApp(k); closeLauncher(); };
+    launcherGrid.appendChild(el);
+  });
+  lucide.createIcons();
+}
+buildLauncher();
+document.getElementById('launcher-input').addEventListener('input', e=>buildLauncher(e.target.value));
+const launcherEl = document.getElementById('launcher');
+document.getElementById('launcher-btn').onclick = (e)=>{
+  e.stopPropagation();
+  launcherEl.classList.toggle('active');
+  document.getElementById('notif-center').classList.remove('active');
+  if(launcherEl.classList.contains('active')){
+    document.getElementById('launcher-input').value='';
+    buildLauncher();
+    setTimeout(()=>document.getElementById('launcher-input').focus(),50);
+  }
+};
+function closeLauncher(){ launcherEl.classList.remove('active'); }
+document.addEventListener('click', (e)=>{
+  if(!launcherEl.contains(e.target)) closeLauncher();
+  if(!document.getElementById('notif-center').contains(e.target) && e.target.id!=='notif-btn') document.getElementById('notif-center').classList.remove('active');
+  document.getElementById('ctx-menu').classList.remove('active');
+});
+let notifs = [];
+const ncList = document.getElementById('nc-list');
+function pushNotif(kind, icon, title, desc, toast=true){
+  const n = {id:Date.now()+Math.random(), icon, title, desc};
+  notifs.unshift(n);
+  renderNotifCenter();
+  if(toast) showToast(icon, title, desc);
+  document.getElementById('notif-btn').querySelector('.notif-dot')?.remove();
+  const dot = document.createElement('div'); dot.className='notif-dot';
+  document.getElementById('notif-btn').appendChild(dot);
+}
+function renderNotifCenter(){
+  if(notifs.length===0){ ncList.innerHTML = `<div class="nc-empty">You're all caught up</div>`; return; }
+  ncList.innerHTML = notifs.map(n=>`
+    <div class="nc-item"><i data-lucide="${n.icon}"></i><div><div class="t">${n.title}</div><div class="d">${n.desc}</div></div></div>
+  `).join('');
+  lucide.createIcons();
+}
+renderNotifCenter();
+document.getElementById('notif-btn').onclick = (e)=>{
+  e.stopPropagation();
+  document.getElementById('notif-center').classList.toggle('active');
+  launcherEl.classList.remove('active');
+  document.getElementById('notif-btn').querySelector('.notif-dot')?.remove();
+};
+document.getElementById('nc-clear').onclick = ()=>{ notifs=[]; renderNotifCenter(); };
+function showToast(icon, title, desc){
+  const box = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className='toast';
+  t.innerHTML = `<i data-lucide="${icon}"></i><div><div class="t">${title}</div><div class="d">${desc}</div></div>`;
+  box.appendChild(t);
+  lucide.createIcons();
+  setTimeout(()=>{ t.classList.add('out'); setTimeout(()=>t.remove(),220); }, 3800);
+}
+let wifiOn = true, volOn = true;
+document.getElementById('wifi-btn').onclick = ()=>{
+  wifiOn=!wifiOn;
+  document.getElementById('wifi-btn').innerHTML = `<i data-lucide="${wifiOn?'wifi':'wifi-off'}"></i>`;
+  lucide.createIcons();
+  showToast(wifiOn?'wifi':'wifi-off', wifiOn?'Wi‑Fi connected':'Wi‑Fi disabled', wifiOn?'Endroid_Home5G':'Network access off');
+};
+document.getElementById('vol-btn').onclick = ()=>{
+  volOn=!volOn;
+  document.getElementById('vol-btn').innerHTML = `<i data-lucide="${volOn?'volume-2':'volume-x'}"></i>`;
+  lucide.createIcons();
+};
+const ctxMenu = document.getElementById('ctx-menu');
+document.getElementById('desktop').addEventListener('contextmenu', (e)=>{
+  e.preventDefault();
+  ctxMenu.innerHTML = `
+    <div class="ctx-item" data-act="refresh"><i data-lucide="refresh-cw"></i>Refresh</div>
+    <div class="ctx-item" data-act="newfolder"><i data-lucide="folder-plus"></i>New folder</div>
+    <div class="ctx-sep"></div>
+    <div class="ctx-item" data-act="settings"><i data-lucide="palette"></i>Personalize</div>
+    <div class="ctx-item" data-act="terminal"><i data-lucide="square-terminal"></i>Open terminal here</div>
+  `;
+  ctxMenu.style.left = e.clientX+'px';
+  ctxMenu.style.top = e.clientY+'px';
+  ctxMenu.classList.add('active');
+  lucide.createIcons();
+  ctxMenu.querySelectorAll('.ctx-item').forEach(item=>{
+    item.onclick = ()=>{
+      const act = item.dataset.act;
+      if(act==='refresh') showToast('refresh-cw','Desktop refreshed','');
+      if(act==='newfolder') showToast('folder-plus','Folder created','New Folder added to desktop');
+      if(act==='settings') openApp('settings');
+      if(act==='terminal') openApp('terminal');
+      ctxMenu.classList.remove('active');
+    };
+  });
+});
+function openApp(key){
+  if(openWindows[key] && openWindows[key].el){
+    restoreWindow(key);
+    focusWindow(key);
+    return;
+  }
+  createWindow(key);
+}
+function toggleApp(key){
+  if(openWindows[key] && openWindows[key].el){
+    const w = openWindows[key];
+    if(w.minimized || w.el.style.display==='none'){ restoreWindow(key); focusWindow(key); }
+    else if(isFocused(key)){ minimizeWindow(key); }
+    else { focusWindow(key); }
+  } else {
+    createWindow(key);
+  }
+}
+function isFocused(key){
+  return openWindows[key] && openWindows[key].el.classList.contains('focused');
+}
+function createWindow(key){
+  const app = APPS[key];
+  const layer = document.getElementById('windows-layer');
+  const id = 'win-'+key;
+  const el = document.createElement('div');
+  el.className='window';
+  el.id = id;
+  winCount++;
+  const offset = (winCount%6)*26;
+  const w = key==='calc'? 320 : 640, h = key==='calc'? 480: 440;
+  el.style.width = w+'px';
+  el.style.height = h+'px';
+  el.style.left = (90+offset)+'px';
+  el.style.top = (50+offset)+'px';
+  el.style.zIndex = ++zTop;
+  el.innerHTML = `
+    <div class="win-titlebar">
+      <span class="win-ico" style="display:inline-flex;width:16px;height:16px;">${iconMarkup(app)}</span>
+      <div class="win-title">${app.name}</div>
+      <div class="win-controls">
+        <button class="win-btn min" title="Minimize"><i data-lucide="minus"></i></button>
+        <button class="win-btn max" title="Maximize"><i data-lucide="square"></i></button>
+        <button class="win-btn close" title="Close"><i data-lucide="x"></i></button>
+      </div>
+    </div>
+    <div class="win-body"></div>
+    <div class="resize-handle"></div>
+  `;
+  layer.appendChild(el);
+  const body = el.querySelector('.win-body');
+  app.render(body, key);
+  openWindows[key] = {el, minimized:false, maximized:false, prevRect:null};
+  el.addEventListener('mousedown', ()=>focusWindow(key));
+  el.addEventListener('touchstart', ()=>focusWindow(key), {passive:true});
+  makeDraggable(el, el.querySelector('.win-titlebar'));
+  makeResizable(el, el.querySelector('.resize-handle'));
+  el.querySelector('.min').onclick = (e)=>{e.stopPropagation(); minimizeWindow(key);};
+  el.querySelector('.max').onclick = (e)=>{e.stopPropagation(); toggleMaximize(key);};
+  el.querySelector('.close').onclick = (e)=>{e.stopPropagation(); closeWindow(key);};
+  el.querySelector('.win-titlebar').ondblclick = ()=>toggleMaximize(key);
+  addTaskbarRunning(key);
+  focusWindow(key);
+  lucide.createIcons();
+}
+function addTaskbarRunning(key){
+  const app = APPS[key];
+  const run = document.getElementById('running-apps');
+  if(app.pinned){
+    const pinBtn = pinnedLayer.querySelector(`[data-app="${key}"]`);
+    pinBtn.classList.add('running','active');
+    return;
+  }
+  let b = run.querySelector(`[data-app="${key}"]`);
+  if(!b){
+    b = document.createElement('button');
+    b.className='taskbar-app running active';
+    b.dataset.app = key;
+    b.innerHTML = `<span style="display:inline-flex;width:17px;height:17px;">${iconMarkup(app)}</span><span>${app.name}</span>`;
+    b.onclick = ()=>toggleApp(key);
+    run.appendChild(b);
+    lucide.createIcons();
+  }
+}
+function removeTaskbarRunning(key){
+  const app = APPS[key];
+  if(app.pinned){
+    pinnedLayer.querySelector(`[data-app="${key}"]`)?.classList.remove('running','active');
+  } else {
+    document.getElementById('running-apps').querySelector(`[data-app="${key}"]`)?.remove();
+  }
+}
+function focusWindow(key){
+  document.querySelectorAll('.window').forEach(w=>w.classList.remove('focused'));
+  document.querySelectorAll('.taskbar-app').forEach(b=>b.classList.remove('active'));
+  const w = openWindows[key];
+  if(!w) return;
+  w.el.style.zIndex = ++zTop;
+  w.el.classList.add('focused');
+  const tb = document.querySelector(`.taskbar-app[data-app="${key}"]`);
+  tb?.classList.add('active');
+}
+function minimizeWindow(key){
+  const w = openWindows[key];
+  w.el.style.display='none';
+  w.minimized = true;
+  document.querySelector(`.taskbar-app[data-app="${key}"]`)?.classList.remove('active');
+}
+function restoreWindow(key){
+  const w = openWindows[key];
+  w.el.style.display='flex';
+  w.minimized = false;
+}
+function toggleMaximize(key){
+  const w = openWindows[key];
+  const el = w.el;
+  if(!w.maximized){
+    w.prevRect = {left:el.style.left, top:el.style.top, width:el.style.width, height:el.style.height};
+    el.style.left='0px'; el.style.top='0px';
+    el.style.width='100%'; el.style.height='calc(100% - 56px)';
+    w.maximized = true;
+  } else {
+    Object.assign(el.style, w.prevRect);
+    w.maximized = false;
+  }
+}
+function closeWindow(key){
+  const w = openWindows[key];
+  if(!w) return;
+  w.el.classList.add('closing');
+  setTimeout(()=>{ w.el.remove(); }, 160);
+  removeTaskbarRunning(key);
+  delete openWindows[key];
+}
+function getPoint(e){
+  if(e.touches && e.touches[0]) return {x:e.touches[0].clientX, y:e.touches[0].clientY};
+  if(e.changedTouches && e.changedTouches[0]) return {x:e.changedTouches[0].clientX, y:e.changedTouches[0].clientY};
+  return {x:e.clientX, y:e.clientY};
+}
+function makeDraggable(el, handle){
+  let sx,sy,ox,oy,dragging=false;
+  function start(e){
+    if(e.target.closest('.win-btn')) return;
+    if(openWindows[Object.keys(openWindows).find(k=>openWindows[k].el===el)]?.maximized) return;
+    dragging=true;
+    const p = getPoint(e);
+    sx=p.x; sy=p.y;
+    const r = el.getBoundingClientRect();
+    ox=r.left; oy=r.top;
+    document.body.style.userSelect='none';
+    if(e.type==='touchstart') e.preventDefault();
+  }
+  function move(e){
+    if(!dragging) return;
+    const p = getPoint(e);
+    const nx = ox + (p.x-sx);
+    const ny = Math.max(0, oy + (p.y-sy));
+    el.style.left = nx+'px';
+    el.style.top = ny+'px';
+    if(e.type==='touchmove') e.preventDefault();
+  }
+  function end(){ dragging=false; document.body.style.userSelect=''; }
+  handle.addEventListener('mousedown', start);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  handle.addEventListener('touchstart', start, {passive:false});
+  window.addEventListener('touchmove', move, {passive:false});
+  window.addEventListener('touchend', end);
+  let lastTap = 0;
+  handle.addEventListener('touchend', (e)=>{
+    if(e.target.closest('.win-btn')) return;
+    const now = Date.now();
+    if(now - lastTap < 320){
+      const key = Object.keys(openWindows).find(k=>openWindows[k].el===el);
+      if(key) toggleMaximize(key);
+    }
+    lastTap = now;
+  });
+}
+function makeResizable(el, handle){
+  let sx,sy,sw,sh,resizing=false;
+  function start(e){
+    e.stopPropagation();
+    resizing=true;
+    const p = getPoint(e);
+    sx=p.x; sy=p.y;
+    const r = el.getBoundingClientRect();
+    sw=r.width; sh=r.height;
+    if(e.type==='touchstart') e.preventDefault();
+  }
+  function move(e){
+    if(!resizing) return;
+    const p = getPoint(e);
+    el.style.width = Math.max(320, sw+(p.x-sx))+'px';
+    el.style.height = Math.max(220, sh+(p.y-sy))+'px';
+    if(e.type==='touchmove') e.preventDefault();
+  }
+  function end(){ resizing=false; }
+  handle.addEventListener('mousedown', start);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  handle.addEventListener('touchstart', start, {passive:false});
+  window.addEventListener('touchmove', move, {passive:false});
+  window.addEventListener('touchend', end);
+}
+const FS = {
+  'Home': {type:'folder', children:{
+    'Documents': {type:'folder', children:{
+      'resume.txt': {type:'file', icon:'file-text'},
+      'notes-endroid.md': {type:'file', icon:'file-text'},
+    }},
+    'Downloads': {type:'folder', children:{
+      'endroid-wallpaper.png': {type:'file', icon:'image'},
+      'sample-app.epk': {type:'file', icon:'package'},
+    }},
+    'Pictures': {type:'folder', children:{
+      'screenshot-01.png': {type:'file', icon:'image'},
+      'screenshot-02.png': {type:'file', icon:'image'},
+    }},
+    'Projects': {type:'folder', children:{
+      'endroid-os': {type:'folder', children:{
+        'manifest.json':{type:'file', icon:'file-json'},
+        'index.html':{type:'file', icon:'file-code'},
+      }},
+    }},
+  }}
+};
+function renderFiles(body){
+  let path = ['Home'];
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <button id="fm-back"><i data-lucide="arrow-left"></i></button>
+        <button id="fm-up"><i data-lucide="arrow-up"></i></button>
+        <div class="path" id="fm-path">/Home</div>
+        <button id="fm-new"><i data-lucide="folder-plus"></i></button>
+      </div>
+      <div class="content"><div class="fm-grid" id="fm-grid"></div></div>
+    </div>
+  `;
+  const grid = body.querySelector('#fm-grid');
+  const pathEl = body.querySelector('#fm-path');
+  const history = [];
+  function getNode(p){
+    let node = FS[p[0]];
+    for(let i=1;i<p.length;i++) node = node.children[p[i]];
+    return node;
+  }
+  function draw(){
+    pathEl.textContent = '/'+path.join('/');
+    const node = getNode(path);
+    grid.innerHTML='';
+    const entries = Object.entries(node.children||{});
+    if(entries.length===0){ grid.innerHTML = `<div style="grid-column:1/-1;padding:30px;text-align:center;color:var(--text-2);font-size:12px;">This folder is empty</div>`; return; }
+    entries.forEach(([name, n])=>{
+      const el = document.createElement('div');
+      el.className='fm-item';
+      const icon = n.type==='folder' ? 'folder' : (n.icon||'file');
+      const color = n.type==='folder' ? 'var(--accent)' : 'var(--text-1)';
+      el.innerHTML = `<div class="ico"><i data-lucide="${icon}" style="stroke:${color}"></i></div><span>${name}</span>`;
+      el.onclick = (e)=>{
+        e.stopPropagation();
+        grid.querySelectorAll('.fm-item').forEach(x=>x.classList.remove('selected'));
+        el.classList.add('selected');
+      };
+      el.ondblclick = ()=>{
+        if(n.type==='folder'){ history.push([...path]); path.push(name); draw(); }
+        else { showToast(icon, 'Opening '+name, 'No default application set for this file type'); }
+      };
+      grid.appendChild(el);
+    });
+    lucide.createIcons();
+  }
+  body.querySelector('#fm-back').onclick = ()=>{ if(history.length){ path = history.pop(); draw(); } };
+  body.querySelector('#fm-up').onclick = ()=>{ if(path.length>1){ history.push([...path]); path.pop(); draw(); } };
+  body.querySelector('#fm-new').onclick = ()=>{
+    const node = getNode(path);
+    const name = 'New Folder';
+    let n2 = name, i=1;
+    while(node.children[n2]) n2 = name+' ('+(i++)+')';
+    node.children[n2] = {type:'folder', children:{}};
+    draw();
+    pushNotif('files','folder-plus','Folder created', n2+' was added', false);
+  };
+  draw();
+}
+function renderBrowser(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="browser-bar">
+        <button style="background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;color:var(--text-1);cursor:pointer;flex:0 0 auto;" id="br-back"><i data-lucide="arrow-left" style="width:14px;height:14px;"></i></button>
+        <button style="background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;color:var(--text-1);cursor:pointer;flex:0 0 auto;" id="br-home"><i data-lucide="home" style="width:14px;height:14px;"></i></button>
+        <input type="text" id="br-url" placeholder="Search Google or enter a web address" />
+        <button style="background:var(--accent);border:none;border-radius:8px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;color:#08110F;cursor:pointer;flex:0 0 auto;" id="br-go"><i data-lucide="arrow-right" style="width:14px;height:14px;"></i></button>
+      </div>
+      <div class="content" style="padding:0;" id="br-content"></div>
+    </div>
+  `;
+  lucide.createIcons();
+  const content = body.querySelector('#br-content');
+  const urlInput = body.querySelector('#br-url');
+  let historyStack = [];
+  function home(){
+    content.innerHTML = `
+      <div class="browser-home">
+        <i data-lucide="compass"></i>
+        <h2>Endroid Browser</h2>
+        <p>Search the web or type any address — pages load right here.</p>
+        <div class="bh-grid">
+          <div class="bh-card" data-u="https://en.wikipedia.org"><i data-lucide="book-open"></i><span>Wikipedia</span></div>
+          <div class="bh-card" data-u="https://news.ycombinator.com"><i data-lucide="newspaper"></i><span>Hacker News</span></div>
+          <div class="bh-card" data-search="Endroid OS"><i data-lucide="search"></i><span>Search "Endroid OS"</span></div>
+          <div class="bh-card" data-u="https://example.com"><i data-lucide="globe"></i><span>Example.com</span></div>
+        </div>
+      </div>
+    `;
+    lucide.createIcons();
+    urlInput.value='';
+    content.querySelectorAll('.bh-card').forEach(c=>{
+      c.onclick = ()=> c.dataset.u ? loadUrl(c.dataset.u) : doSearch(c.dataset.search);
+    });
+  }
+  function showFrame(src, displayVal){
+    historyStack.push(src);
+    urlInput.value = displayVal || src;
+    content.innerHTML = `<iframe src="${src}" style="width:100%;height:100%;border:none;background:#fff;" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>`;
+  }
+  function doSearch(q){
+    const src = 'https://www.google.com/search?igu=1&q=' + encodeURIComponent(q);
+    showFrame(src, q);
+  }
+  function loadUrl(u){
+    let target = u.trim();
+    if(!target){ return; }
+    const looksLikeUrl = /^https?:\/\//i.test(target) || (/\.[a-z]{2,}$/i.test(target) && !target.includes(' '));
+    if(!looksLikeUrl){ doSearch(target); return; }
+    if(!/^https?:\/\//i.test(target)) target = 'https://' + target;
+    showFrame(target, target.replace(/^https?:\/\//,''));
+  }
+  function navigateTo(u){ loadUrl(u); }
+  body.querySelector('#br-home').onclick = ()=>{ historyStack=[]; home(); };
+  body.querySelector('#br-back').onclick = ()=>{
+    historyStack.pop();
+    const prev = historyStack.pop();
+    if(prev) showFrame(prev); else home();
+  };
+  body.querySelector('#br-go').onclick = ()=>navigateTo(urlInput.value);
+  urlInput.addEventListener('keydown', e=>{ if(e.key==='Enter') navigateTo(e.target.value); });
+  home();
+}
+const WMO = {
+  0:['Clear sky','sun'],1:['Mainly clear','sun'],2:['Partly cloudy','cloud-sun'],3:['Overcast','cloud'],
+  45:['Fog','cloud-fog'],48:['Rime fog','cloud-fog'],
+  51:['Light drizzle','cloud-drizzle'],53:['Drizzle','cloud-drizzle'],55:['Dense drizzle','cloud-drizzle'],
+  61:['Light rain','cloud-rain'],63:['Rain','cloud-rain'],65:['Heavy rain','cloud-rain-wind'],
+  71:['Light snow','cloud-snow'],73:['Snow','cloud-snow'],75:['Heavy snow','cloud-snow'],
+  80:['Rain showers','cloud-rain'],81:['Rain showers','cloud-rain'],82:['Violent showers','cloud-rain-wind'],
+  95:['Thunderstorm','cloud-lightning'],96:['Thunderstorm w/ hail','cloud-lightning'],99:['Severe storm','cloud-lightning'],
+};
+function renderWeather(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <i data-lucide="map-pin" style="width:14px;height:14px;stroke:var(--text-2);flex:0 0 auto;"></i>
+        <input id="wx-city" type="text" placeholder="Search a city…" value="London"
+          style="flex:1;background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;padding:7px 10px;color:var(--text-0);font-size:12.5px;outline:none;">
+        <button id="wx-go"><i data-lucide="search"></i></button>
+      </div>
+      <div class="content" id="wx-content">
+        <div class="empty-state"><i data-lucide="loader"></i><span>Loading weather…</span></div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const contentEl = body.querySelector('#wx-content');
+  const cityInput = body.querySelector('#wx-city');
+  async function search(city){
+    contentEl.innerHTML = `<div class="empty-state"><i data-lucide="loader"></i><span>Loading weather…</span></div>`;
+    lucide.createIcons();
+    try{
+      const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`);
+      const geo = await geoRes.json();
+      if(!geo.results || !geo.results.length){
+        contentEl.innerHTML = `<div class="empty-state"><i data-lucide="map-pin-off"></i><span>No location found for "${city}"</span></div>`;
+        lucide.createIcons();
+        return;
+      }
+      const place = geo.results[0];
+      const wxRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto`);
+      const wx = await wxRes.json();
+      drawWeather(place, wx);
+    }catch(e){
+      contentEl.innerHTML = `<div class="empty-state"><i data-lucide="wifi-off"></i><span>Couldn't reach the weather service. Try again.</span></div>`;
+      lucide.createIcons();
+    }
+  }
+  function drawWeather(place, wx){
+    const cur = wx.current;
+    const [curLabel, curIcon] = WMO[cur.weather_code] || ['Unknown','cloud'];
+    const days = wx.daily.time.map((d,i)=>({
+      d, max: Math.round(wx.daily.temperature_2m_max[i]), min: Math.round(wx.daily.temperature_2m_min[i]),
+      icon: (WMO[wx.daily.weather_code[i]]||['','cloud'])[1]
+    })).slice(0,6);
+    contentEl.innerHTML = `
+      <div style="text-align:center;padding:10px 0 18px;">
+        <div style="font-size:12.5px;color:var(--text-1);">${place.name}${place.admin1? ', '+place.admin1:''}, ${place.country}</div>
+        <i data-lucide="${curIcon}" style="width:56px;height:56px;stroke:var(--accent);margin:10px 0;"></i>
+        <div style="font-family:var(--font-display);font-size:44px;font-weight:600;color:var(--text-0);">${Math.round(cur.temperature_2m)}°C</div>
+        <div style="font-size:12.5px;color:var(--text-1);">${curLabel} · Feels like ${Math.round(cur.apparent_temperature)}°C</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:18px;">
+        <div style="flex:1;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:10px;padding:12px;text-align:center;">
+          <div style="font-size:10.5px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.4px;">Humidity</div>
+          <div style="font-size:16px;font-weight:600;color:var(--text-0);margin-top:4px;">${cur.relative_humidity_2m}%</div>
+        </div>
+        <div style="flex:1;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:10px;padding:12px;text-align:center;">
+          <div style="font-size:10.5px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.4px;">Wind</div>
+          <div style="font-size:16px;font-weight:600;color:var(--text-0);margin-top:4px;">${Math.round(cur.wind_speed_10m)} km/h</div>
+        </div>
+      </div>
+      <div style="font-size:10.5px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:8px;">6‑day forecast</div>
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        ${days.map(day=>`
+          <div style="display:flex;align-items:center;gap:10px;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:9px;padding:9px 12px;">
+            <div style="width:70px;font-size:11.5px;color:var(--text-1);">${new Date(day.d+'T00:00').toLocaleDateString([], {weekday:'short'})}</div>
+            <i data-lucide="${day.icon}" style="width:16px;height:16px;stroke:var(--accent);"></i>
+            <div style="flex:1;"></div>
+            <div style="font-size:12px;color:var(--text-2);">${day.min}°</div>
+            <div style="font-size:12px;font-weight:600;color:var(--text-0);">${day.max}°</div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+    lucide.createIcons();
+  }
+  body.querySelector('#wx-go').onclick = ()=>search(cityInput.value || 'London');
+  cityInput.addEventListener('keydown', e=>{ if(e.key==='Enter') search(cityInput.value || 'London'); });
+  search('London');
+}
+function renderFacts(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="content" style="display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;height:100%;">
+        <i data-lucide="sparkles" style="width:34px;height:34px;stroke:var(--accent);margin-bottom:16px;"></i>
+        <div id="fact-text" style="font-family:var(--font-display);font-size:17px;line-height:1.5;color:var(--text-0);max-width:420px;margin-bottom:22px;">Loading a useless fact…</div>
+        <button id="fact-next" style="background:var(--accent);border:none;border-radius:9px;padding:10px 20px;color:#08110F;font-weight:600;font-size:12.5px;cursor:pointer;font-family:var(--font-body);display:flex;align-items:center;gap:7px;">
+          <i data-lucide="refresh-cw" style="width:14px;height:14px;"></i>Another fact
+        </button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const textEl = body.querySelector('#fact-text');
+  const btn = body.querySelector('#fact-next');
+  async function loadFact(){
+    textEl.textContent = 'Loading a useless fact…';
+    btn.disabled = true;
+    try{
+      const res = await fetch('https://useless.endroid.workers.dev/api/v1');
+      const data = await res.json();
+      const fact = data.fact || data.text || data.data || (typeof data==='string'? data : JSON.stringify(data));
+      textEl.textContent = fact;
+    }catch(e){
+      textEl.textContent = "Couldn't fetch a fact right now — the useless facts service might be unreachable.";
+    }
+    btn.disabled = false;
+  }
+  btn.onclick = loadFact;
+  loadFact();
+}
+function renderCurrency(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="content" style="max-width:420px;">
+        <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:14px;">
+          <div style="flex:1;">
+            <div style="font-size:10.5px;color:var(--text-2);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.4px;">Amount</div>
+            <input id="cv-amount" type="number" value="100" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 10px;color:var(--text-0);font-size:14px;outline:none;">
+          </div>
+          <div>
+            <div style="font-size:10.5px;color:var(--text-2);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.4px;">From</div>
+            <select id="cv-from" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 8px;color:var(--text-0);font-size:13px;outline:none;"></select>
+          </div>
+          <button id="cv-swap" style="background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;color:var(--text-1);cursor:pointer;"><i data-lucide="arrow-left-right" style="width:15px;height:15px;"></i></button>
+          <div>
+            <div style="font-size:10.5px;color:var(--text-2);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.4px;">To</div>
+            <select id="cv-to" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 8px;color:var(--text-0);font-size:13px;outline:none;"></select>
+          </div>
+        </div>
+        <div id="cv-result" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:12px;padding:20px;text-align:center;">
+          <div class="empty-state" style="height:auto;padding:10px 0;"><i data-lucide="loader"></i><span>Loading rates…</span></div>
+        </div>
+        <div id="cv-updated" style="font-size:10.5px;color:var(--text-2);text-align:center;margin-top:10px;"></div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const CURRENCIES = ['USD','EUR','GBP','JPY','INR','PKR','AUD','CAD','CNY','CHF','AED','SGD'];
+  const fromSel = body.querySelector('#cv-from');
+  const toSel = body.querySelector('#cv-to');
+  CURRENCIES.forEach(c=>{
+    fromSel.innerHTML += `<option value="${c}" ${c==='USD'?'selected':''}>${c}</option>`;
+    toSel.innerHTML += `<option value="${c}" ${c==='PKR'?'selected':''}>${c}</option>`;
+  });
+  const amountEl = body.querySelector('#cv-amount');
+  const resultEl = body.querySelector('#cv-result');
+  const updatedEl = body.querySelector('#cv-updated');
+  async function convert(){
+    resultEl.innerHTML = `<div class="empty-state" style="height:auto;padding:10px 0;"><i data-lucide="loader"></i><span>Converting…</span></div>`;
+    lucide.createIcons();
+    const amt = parseFloat(amountEl.value) || 0;
+    const from = fromSel.value, to = toSel.value;
+    try{
+      const res = await fetch(`https://api.frankfurter.app/latest?amount=${amt}&from=${from}&to=${to}`);
+      const data = await res.json();
+      const val = data.rates[to];
+      resultEl.innerHTML = `
+        <div style="font-size:11.5px;color:var(--text-2);margin-bottom:6px;">${amt} ${from} equals</div>
+        <div style="font-family:var(--font-display);font-size:32px;font-weight:600;color:var(--accent);">${val.toLocaleString(undefined,{maximumFractionDigits:2})} ${to}</div>
+      `;
+      updatedEl.textContent = 'Rates as of ' + data.date;
+    }catch(e){
+      resultEl.innerHTML = `<div class="empty-state" style="height:auto;padding:10px 0;"><i data-lucide="wifi-off"></i><span>Couldn't fetch exchange rates.</span></div>`;
+      lucide.createIcons();
+    }
+  }
+  body.querySelector('#cv-swap').onclick = ()=>{
+    const f = fromSel.value; fromSel.value = toSel.value; toSel.value = f;
+    convert();
+  };
+  [amountEl, fromSel, toSel].forEach(el=>el.addEventListener('change', convert));
+  amountEl.addEventListener('input', ()=>{ clearTimeout(window.__cvT); window.__cvT=setTimeout(convert,400); });
+  convert();
+}
+function renderPassword(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="content" style="max-width:420px;">
+        <div style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:12px;padding:18px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">
+          <div id="pw-output" style="flex:1;font-family:var(--font-mono);font-size:16px;color:var(--text-0);word-break:break-all;">••••••••••••</div>
+          <button id="pw-copy" style="background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;width:34px;height:34px;display:flex;align-items:center;justify-content:center;color:var(--text-1);cursor:pointer;flex:0 0 auto;"><i data-lucide="copy" style="width:14px;height:14px;"></i></button>
+        </div>
+        <div class="set-row"><div class="lbl">Length: <span id="pw-len-val">16</span></div><input id="pw-len" type="range" min="6" max="48" value="16" style="width:160px;accent-color:var(--accent);"></div>
+        <div class="set-row"><div class="lbl">Uppercase (A–Z)</div><div class="toggle on" data-k="upper"><div class="knob"></div></div></div>
+        <div class="set-row"><div class="lbl">Lowercase (a–z)</div><div class="toggle on" data-k="lower"><div class="knob"></div></div></div>
+        <div class="set-row"><div class="lbl">Numbers (0–9)</div><div class="toggle on" data-k="numbers"><div class="knob"></div></div></div>
+        <div class="set-row"><div class="lbl">Symbols (!@#$…)</div><div class="toggle on" data-k="symbols"><div class="knob"></div></div></div>
+        <button id="pw-gen" style="width:100%;margin-top:8px;background:var(--accent);border:none;border-radius:9px;padding:11px;color:#08110F;font-weight:600;font-size:12.5px;cursor:pointer;font-family:var(--font-body);display:flex;align-items:center;justify-content:center;gap:7px;">
+          <i data-lucide="refresh-cw" style="width:14px;height:14px;"></i>Generate new password
+        </button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const opts = {upper:true, lower:true, numbers:true, symbols:true};
+  const lenInput = body.querySelector('#pw-len');
+  const lenVal = body.querySelector('#pw-len-val');
+  const output = body.querySelector('#pw-output');
+  const sets = {
+    upper:'ABCDEFGHIJKLMNOPQRSTUVWXYZ', lower:'abcdefghijklmnopqrstuvwxyz',
+    numbers:'0123456789', symbols:'!@#$%^&*()-_=+[]{}?'
+  };
+  function generate(){
+    let pool = '';
+    Object.keys(opts).forEach(k=>{ if(opts[k]) pool += sets[k]; });
+    if(!pool){ output.textContent = 'Select at least one character type'; return; }
+    const len = parseInt(lenInput.value);
+    const arr = new Uint32Array(len);
+    crypto.getRandomValues(arr);
+    let pass = '';
+    for(let i=0;i<len;i++) pass += pool[arr[i] % pool.length];
+    output.textContent = pass;
+  }
+  lenInput.addEventListener('input', ()=>{ lenVal.textContent = lenInput.value; generate(); });
+  body.querySelectorAll('.toggle[data-k]').forEach(t=>{
+    t.onclick = ()=>{ const k=t.dataset.k; opts[k]=!opts[k]; t.classList.toggle('on'); generate(); };
+  });
+  body.querySelector('#pw-gen').onclick = generate;
+  body.querySelector('#pw-copy').onclick = ()=>{
+    navigator.clipboard?.writeText(output.textContent).then(()=>showToast('check','Copied','Password copied to clipboard'));
+  };
+  generate();
+}
+function renderQR(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="content" style="display:flex;flex-direction:column;align-items:center;">
+        <input id="qr-text" type="text" placeholder="Enter text or URL…" value="https://endroid.zone.id"
+          style="width:100%;max-width:360px;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:9px;padding:10px 12px;color:var(--text-0);font-size:13px;outline:none;margin-bottom:16px;">
+        <div style="background:#fff;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,0.25);">
+          <img id="qr-img" width="220" height="220" style="display:block;" src="" alt="QR code">
+        </div>
+        <button id="qr-dl" style="margin-top:16px;background:var(--accent);border:none;border-radius:9px;padding:9px 18px;color:#08110F;font-weight:600;font-size:12.5px;cursor:pointer;font-family:var(--font-body);display:flex;align-items:center;gap:7px;">
+          <i data-lucide="download" style="width:14px;height:14px;"></i>Download PNG
+        </button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const input = body.querySelector('#qr-text');
+  const img = body.querySelector('#qr-img');
+  function update(){
+    const text = input.value.trim() || 'https://endroid.zone.id';
+    img.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(text)}`;
+  }
+  input.addEventListener('input', ()=>{ clearTimeout(window.__qrT); window.__qrT=setTimeout(update,350); });
+  body.querySelector('#qr-dl').onclick = ()=>{
+    const a = document.createElement('a');
+    a.href = img.src; a.download = 'endroid-qr.png'; a.target='_blank';
+    a.click();
+  };
+  update();
+}
+const UNIT_GROUPS = {
+  Length: { m:1, km:1000, cm:0.01, mm:0.001, mi:1609.344, yd:0.9144, ft:0.3048, in:0.0254 },
+  Weight: { kg:1, g:0.001, mg:0.000001, lb:0.453592, oz:0.0283495, ton:1000 },
+  Temperature: null,
+  Data: { B:1, KB:1024, MB:1024**2, GB:1024**3, TB:1024**4 },
+};
+function renderUnits(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <div class="seg" id="un-group" style="flex:1;">
+          <button data-g="Length" class="active">Length</button>
+          <button data-g="Weight">Weight</button>
+          <button data-g="Temperature">Temp</button>
+          <button data-g="Data">Data</button>
+        </div>
+      </div>
+      <div class="content" style="max-width:420px;">
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:16px;">
+          <input id="un-val" type="number" value="1" style="flex:1;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 10px;color:var(--text-0);font-size:14px;outline:none;">
+          <select id="un-from" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 8px;color:var(--text-0);font-size:13px;outline:none;"></select>
+          <i data-lucide="arrow-right" style="width:15px;height:15px;stroke:var(--text-2);flex:0 0 auto;"></i>
+          <select id="un-to" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:9px 8px;color:var(--text-0);font-size:13px;outline:none;"></select>
+        </div>
+        <div id="un-result" style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:12px;padding:20px;text-align:center;">
+          <div style="font-family:var(--font-display);font-size:30px;font-weight:600;color:var(--accent);" id="un-result-val">—</div>
+        </div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  let group = 'Length';
+  const fromSel = body.querySelector('#un-from');
+  const toSel = body.querySelector('#un-to');
+  const valInput = body.querySelector('#un-val');
+  const resultVal = body.querySelector('#un-result-val');
+  function populate(){
+    const units = group==='Temperature' ? ['C','F','K'] : Object.keys(UNIT_GROUPS[group]);
+    fromSel.innerHTML = units.map(u=>`<option value="${u}">${u}</option>`).join('');
+    toSel.innerHTML = units.map((u,i)=>`<option value="${u}" ${i===1?'selected':''}>${u}</option>`).join('');
+    compute();
+  }
+  function tempToC(v,u){ return u==='C'?v : u==='F'? (v-32)*5/9 : v-273.15; }
+  function cToTemp(c,u){ return u==='C'?c : u==='F'? c*9/5+32 : c+273.15; }
+  function compute(){
+    const v = parseFloat(valInput.value);
+    if(isNaN(v)){ resultVal.textContent='—'; return; }
+    let out;
+    if(group==='Temperature'){
+      out = cToTemp(tempToC(v, fromSel.value), toSel.value);
+    } else {
+      const table = UNIT_GROUPS[group];
+      out = v * table[fromSel.value] / table[toSel.value];
+    }
+    resultVal.textContent = (Math.round(out*10000)/10000).toLocaleString() + ' ' + toSel.value;
+  }
+  body.querySelectorAll('#un-group button').forEach(b=>{
+    b.onclick = ()=>{
+      body.querySelectorAll('#un-group button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+      group = b.dataset.g;
+      populate();
+    };
+  });
+  [valInput, fromSel, toSel].forEach(el=>el.addEventListener('input', compute));
+  populate();
+}
+function renderGallery(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <div class="path" style="text-align:left;">Curated photo stream</div>
+        <button id="gal-shuffle"><i data-lucide="shuffle"></i></button>
+      </div>
+      <div class="content" id="gal-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;"></div>
+    </div>
+    <div id="gal-viewer" style="position:absolute;inset:0;background:rgba(0,0,0,0.9);display:none;align-items:center;justify-content:center;z-index:20;">
+      <img id="gal-viewer-img" style="max-width:90%;max-height:90%;border-radius:8px;">
+      <button id="gal-viewer-close" style="position:absolute;top:14px;right:14px;background:rgba(255,255,255,0.15);border:none;border-radius:8px;width:34px;height:34px;display:flex;align-items:center;justify-content:center;color:#fff;cursor:pointer;"><i data-lucide="x"></i></button>
+    </div>
+  `;
+  lucide.createIcons();
+  const grid = body.querySelector('#gal-grid');
+  const viewer = body.querySelector('#gal-viewer');
+  const viewerImg = body.querySelector('#gal-viewer-img');
+  function load(){
+    grid.innerHTML='';
+    const seed = Math.floor(Math.random()*10000);
+    for(let i=0;i<18;i++){
+      const img = document.createElement('img');
+      const id = seed + i;
+      img.src = `https://picsum.photos/seed/${id}/240/240`;
+      img.loading='lazy';
+      img.style.cssText = 'width:100%;aspect-ratio:1;object-fit:cover;border-radius:9px;cursor:pointer;border:1px solid var(--line-soft);background:var(--bg-2);';
+      img.onclick = ()=>{ viewerImg.src = `https://picsum.photos/seed/${id}/1200/1200`; viewer.style.display='flex'; };
+      grid.appendChild(img);
+    }
+  }
+  body.querySelector('#gal-shuffle').onclick = load;
+  body.querySelector('#gal-viewer-close').onclick = ()=> viewer.style.display='none';
+  viewer.onclick = (e)=>{ if(e.target===viewer) viewer.style.display='none'; };
+  load();
+}
+const MUSIC_TRACKS = Array.from({length:10}, (_,i)=>({
+  title:`Session ${i+1}`, artist:'Endroid Sessions',
+  src:`https://www.soundhelix.com/examples/mp3/SoundHelix-Song-${i+1}.mp3`
+}));
+function renderMusic(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="content" style="display:flex;flex-direction:column;height:100%;padding:0;">
+        <div style="padding:20px 20px 14px;text-align:center;border-bottom:1px solid var(--line-soft);">
+          <div style="width:120px;height:120px;border-radius:14px;background:linear-gradient(145deg,var(--accent),var(--accent-dim));display:flex;align-items:center;justify-content:center;margin:0 auto 14px;">
+            <i data-lucide="music-4" style="width:44px;height:44px;stroke:#08110F;"></i>
+          </div>
+          <div id="mu-title" style="font-family:var(--font-display);font-weight:600;font-size:15px;color:var(--text-0);"></div>
+          <div id="mu-artist" style="font-size:11.5px;color:var(--text-2);margin-top:2px;"></div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:14px;">
+            <span id="mu-cur" style="font-size:10px;color:var(--text-2);font-family:var(--font-mono);width:32px;">0:00</span>
+            <input id="mu-seek" type="range" min="0" max="100" value="0" style="flex:1;accent-color:var(--accent);">
+            <span id="mu-dur" style="font-size:10px;color:var(--text-2);font-family:var(--font-mono);width:32px;">0:00</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px;">
+            <button id="mu-prev" style="background:none;border:none;color:var(--text-1);cursor:pointer;"><i data-lucide="skip-back"></i></button>
+            <button id="mu-play" style="background:var(--accent);border:none;border-radius:50%;width:44px;height:44px;display:flex;align-items:center;justify-content:center;color:#08110F;cursor:pointer;"><i data-lucide="play"></i></button>
+            <button id="mu-next" style="background:none;border:none;color:var(--text-1);cursor:pointer;"><i data-lucide="skip-forward"></i></button>
+          </div>
+        </div>
+        <div id="mu-list" style="flex:1;overflow-y:auto;"></div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const audio = new Audio();
+  let idx = 0;
+  const titleEl = body.querySelector('#mu-title');
+  const artistEl = body.querySelector('#mu-artist');
+  const playBtn = body.querySelector('#mu-play');
+  const seek = body.querySelector('#mu-seek');
+  const curEl = body.querySelector('#mu-cur');
+  const durEl = body.querySelector('#mu-dur');
+  const listEl = body.querySelector('#mu-list');
+  function fmt(s){ if(!isFinite(s)) return '0:00'; const m=Math.floor(s/60), sec=Math.floor(s%60); return m+':'+String(sec).padStart(2,'0'); }
+  function drawList(){
+    listEl.innerHTML = MUSIC_TRACKS.map((t,i)=>`
+      <div class="note-row ${i===idx?'active':''}" data-i="${i}" style="display:flex;align-items:center;gap:10px;">
+        <i data-lucide="${i===idx?'volume-2':'music-2'}" style="width:14px;height:14px;stroke:var(--accent);flex:0 0 auto;"></i>
+        <div style="flex:1;"><div class="nt">${t.title}</div><div class="np">${t.artist}</div></div>
+      </div>`).join('');
+    lucide.createIcons();
+    listEl.querySelectorAll('.note-row').forEach(r=>{
+      r.onclick = ()=>{ idx = Number(r.dataset.i); loadTrack(true); };
+    });
+  }
+  function loadTrack(autoplay){
+    const t = MUSIC_TRACKS[idx];
+    titleEl.textContent = t.title;
+    artistEl.textContent = t.artist;
+    audio.src = t.src;
+    drawList();
+    if(autoplay) audio.play().catch(()=>{});
+  }
+  audio.addEventListener('loadedmetadata', ()=>{ durEl.textContent = fmt(audio.duration); });
+  audio.addEventListener('timeupdate', ()=>{
+    curEl.textContent = fmt(audio.currentTime);
+    seek.value = audio.duration ? (audio.currentTime/audio.duration)*100 : 0;
+  });
+  audio.addEventListener('play', ()=>{ playBtn.innerHTML = '<i data-lucide="pause"></i>'; lucide.createIcons(); });
+  audio.addEventListener('pause', ()=>{ playBtn.innerHTML = '<i data-lucide="play"></i>'; lucide.createIcons(); });
+  audio.addEventListener('ended', ()=>{ idx = (idx+1)%MUSIC_TRACKS.length; loadTrack(true); });
+  playBtn.onclick = ()=>{ audio.paused ? audio.play().catch(()=>{}) : audio.pause(); };
+  body.querySelector('#mu-prev').onclick = ()=>{ idx = (idx-1+MUSIC_TRACKS.length)%MUSIC_TRACKS.length; loadTrack(true); };
+  body.querySelector('#mu-next').onclick = ()=>{ idx = (idx+1)%MUSIC_TRACKS.length; loadTrack(true); };
+  seek.addEventListener('input', ()=>{ if(audio.duration) audio.currentTime = (seek.value/100)*audio.duration; });
+  loadTrack(false);
+}
+function loadCalEvents(){ try{ return JSON.parse(localStorage.getItem('endroid_cal')) || {}; }catch(e){ return {}; } }
+function saveCalEvents(o){ localStorage.setItem('endroid_cal', JSON.stringify(o)); }
+function renderCalendar(body){
+  let view = new Date(); view.setDate(1);
+  let selected = new Date();
+  let events = loadCalEvents();
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <button id="cal-prev"><i data-lucide="chevron-left"></i></button>
+        <div class="path" id="cal-label" style="text-align:center;"></div>
+        <button id="cal-next"><i data-lucide="chevron-right"></i></button>
+        <button id="cal-today"><i data-lucide="calendar-check"></i></button>
+      </div>
+      <div class="split" style="height:calc(100% - 51px);">
+        <div style="flex:1;padding:12px;overflow-y:auto;">
+          <div id="cal-grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;"></div>
+        </div>
+        <div class="sidebar" style="width:200px;">
+          <div style="padding:6px 6px 10px;font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.4px;" id="cal-sel-label"></div>
+          <div id="cal-events" style="display:flex;flex-direction:column;gap:6px;padding:0 6px;"></div>
+          <div style="padding:10px 6px;">
+            <input id="cal-new-event" type="text" placeholder="Add a note…" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:8px 9px;color:var(--text-0);font-size:12px;outline:none;">
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const grid = body.querySelector('#cal-grid');
+  const label = body.querySelector('#cal-label');
+  const evList = body.querySelector('#cal-events');
+  const selLabel = body.querySelector('#cal-sel-label');
+  const newInput = body.querySelector('#cal-new-event');
+  const dayNames = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+  function key(d){ return d.toISOString().slice(0,10); }
+  function draw(){
+    label.textContent = view.toLocaleDateString([], {month:'long', year:'numeric'});
+    grid.innerHTML = dayNames.map(d=>`<div style="text-align:center;font-size:10px;color:var(--text-2);padding:4px 0;">${d}</div>`).join('');
+    const first = new Date(view.getFullYear(), view.getMonth(), 1);
+    const startOffset = first.getDay();
+    const daysInMonth = new Date(view.getFullYear(), view.getMonth()+1, 0).getDate();
+    const today = new Date();
+    for(let i=0;i<startOffset;i++) grid.innerHTML += `<div></div>`;
+    for(let d=1; d<=daysInMonth; d++){
+      const date = new Date(view.getFullYear(), view.getMonth(), d);
+      const isToday = date.toDateString()===today.toDateString();
+      const isSel = date.toDateString()===selected.toDateString();
+      const hasEv = (events[key(date)]||[]).length>0;
+      const cell = document.createElement('div');
+      cell.style.cssText = `aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:8px;cursor:pointer;font-size:12px;position:relative;
+        background:${isSel?'var(--accent-glow)':'transparent'};color:${isToday?'var(--accent)':'var(--text-0)'};font-weight:${isToday?'700':'400'};`;
+      cell.innerHTML = `${d}${hasEv?'<div style="width:4px;height:4px;border-radius:50%;background:var(--accent);position:absolute;bottom:4px;"></div>':''}`;
+      cell.onclick = ()=>{ selected = date; draw(); };
+      grid.appendChild(cell);
+    }
+    selLabel.textContent = selected.toLocaleDateString([], {weekday:'long', month:'short', day:'numeric'});
+    const evs = events[key(selected)] || [];
+    evList.innerHTML = evs.length ? evs.map((e,i)=>`
+      <div style="background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:8px 10px;display:flex;align-items:center;gap:8px;">
+        <div style="flex:1;font-size:12px;color:var(--text-0);">${e}</div>
+        <button data-i="${i}" class="cal-del" style="background:none;border:none;color:var(--text-2);cursor:pointer;"><i data-lucide="x" style="width:12px;height:12px;"></i></button>
+      </div>`).join('') : `<div style="font-size:11.5px;color:var(--text-2);padding:4px 0;">No notes for this day</div>`;
+    lucide.createIcons();
+    evList.querySelectorAll('.cal-del').forEach(btn=>{
+      btn.onclick = ()=>{
+        const i = Number(btn.dataset.i);
+        events[key(selected)].splice(i,1);
+        saveCalEvents(events);
+        draw();
+      };
+    });
+  }
+  body.querySelector('#cal-prev').onclick = ()=>{ view.setMonth(view.getMonth()-1); draw(); };
+  body.querySelector('#cal-next').onclick = ()=>{ view.setMonth(view.getMonth()+1); draw(); };
+  body.querySelector('#cal-today').onclick = ()=>{ view = new Date(); view.setDate(1); selected = new Date(); draw(); };
+  newInput.addEventListener('keydown', e=>{
+    if(e.key==='Enter' && newInput.value.trim()){
+      const k = key(selected);
+      events[k] = events[k]||[];
+      events[k].push(newInput.value.trim());
+      saveCalEvents(events);
+      newInput.value='';
+      draw();
+    }
+  });
+  draw();
+}
+function loadContacts(){
+  try{ return JSON.parse(localStorage.getItem('endroid_contacts')) || defaultContacts(); }
+  catch(e){ return defaultContacts(); }
+}
+function defaultContacts(){
+  return [
+    {id:1, name:'Ayesha Khan', phone:'+92 300 1234567', email:'ayesha@example.com'},
+    {id:2, name:'Ben Carter', phone:'+1 415 555 0192', email:'ben@example.com'},
+  ];
+}
+function saveContacts(list){ localStorage.setItem('endroid_contacts', JSON.stringify(list)); }
+function renderContacts(body){
+  let contacts = loadContacts();
+  let activeId = contacts[0]?.id;
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <i data-lucide="search" style="width:14px;height:14px;stroke:var(--text-2);flex:0 0 auto;"></i>
+        <input id="ct-search" type="text" placeholder="Search contacts…" style="flex:1;background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;padding:7px 10px;color:var(--text-0);font-size:12.5px;outline:none;">
+        <button id="ct-new"><i data-lucide="user-plus"></i></button>
+      </div>
+      <div class="notes-split">
+        <div class="notes-list" id="ct-list"></div>
+        <div class="content" id="ct-detail" style="flex:1;"></div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const listEl = body.querySelector('#ct-list');
+  const detailEl = body.querySelector('#ct-detail');
+  const searchEl = body.querySelector('#ct-search');
+  function avatarUrl(name){ return `https://ui-avatars.com/api/?background=4FD1C5&color=08110F&bold=true&name=${encodeURIComponent(name||'?')}`; }
+  function drawList(){
+    const q = searchEl.value.toLowerCase();
+    const filtered = contacts.filter(c=>c.name.toLowerCase().includes(q));
+    listEl.innerHTML = filtered.map(c=>`
+      <div class="note-row ${c.id===activeId?'active':''}" data-id="${c.id}" style="display:flex;align-items:center;gap:10px;">
+        <img src="${avatarUrl(c.name)}" style="width:28px;height:28px;border-radius:50%;flex:0 0 auto;">
+        <div><div class="nt">${c.name}</div><div class="np">${c.phone||''}</div></div>
+      </div>`).join('') || `<div style="padding:20px;text-align:center;color:var(--text-2);font-size:12px;">No contacts found</div>`;
+    listEl.querySelectorAll('.note-row').forEach(r=>{
+      r.onclick = ()=>{ activeId = Number(r.dataset.id); drawList(); drawDetail(); };
+    });
+  }
+  function drawDetail(){
+    const c = contacts.find(x=>x.id===activeId);
+    if(!c){ detailEl.innerHTML = `<div class="empty-state"><i data-lucide="user-x"></i><span>No contact selected</span></div>`; lucide.createIcons(); return; }
+    detailEl.innerHTML = `
+      <div style="text-align:center;padding:10px 0 20px;">
+        <img src="${avatarUrl(c.name)}" style="width:76px;height:76px;border-radius:50%;margin-bottom:10px;">
+      </div>
+      <div style="max-width:320px;margin:0 auto;">
+        <div style="font-size:10.5px;color:var(--text-2);margin-bottom:4px;">Name</div>
+        <input id="ct-name" type="text" value="${c.name}" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:8px 10px;color:var(--text-0);font-size:13px;outline:none;margin-bottom:10px;">
+        <div style="font-size:10.5px;color:var(--text-2);margin-bottom:4px;">Phone</div>
+        <input id="ct-phone" type="text" value="${c.phone||''}" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:8px 10px;color:var(--text-0);font-size:13px;outline:none;margin-bottom:10px;">
+        <div style="font-size:10.5px;color:var(--text-2);margin-bottom:4px;">Email</div>
+        <input id="ct-email" type="text" value="${c.email||''}" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:8px;padding:8px 10px;color:var(--text-0);font-size:13px;outline:none;margin-bottom:16px;">
+        <button id="ct-delete" style="width:100%;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:9px;padding:9px;color:var(--danger);font-size:12.5px;cursor:pointer;font-family:var(--font-body);display:flex;align-items:center;justify-content:center;gap:7px;">
+          <i data-lucide="trash-2" style="width:14px;height:14px;"></i>Delete contact
+        </button>
+      </div>
+    `;
+    lucide.createIcons();
+    function persist(){
+      c.name = body.querySelector('#ct-name').value;
+      c.phone = body.querySelector('#ct-phone').value;
+      c.email = body.querySelector('#ct-email').value;
+      saveContacts(contacts);
+      drawList();
+    }
+    ['#ct-name','#ct-phone','#ct-email'].forEach(sel=> body.querySelector(sel).addEventListener('input', persist));
+    body.querySelector('#ct-delete').onclick = ()=>{
+      contacts = contacts.filter(x=>x.id!==activeId);
+      saveContacts(contacts);
+      activeId = contacts[0]?.id;
+      drawList(); drawDetail();
+    };
+  }
+  searchEl.addEventListener('input', drawList);
+  body.querySelector('#ct-new').onclick = ()=>{
+    const c = {id:Date.now(), name:'New Contact', phone:'', email:''};
+    contacts.unshift(c); activeId = c.id;
+    saveContacts(contacts); drawList(); drawDetail();
+  };
+  drawList(); drawDetail();
+}
+function loadNotesData(){
+  try{ return JSON.parse(localStorage.getItem('endroid_notes')) || defaultNotes(); }
+  catch(e){ return defaultNotes(); }
+}
+function defaultNotes(){
+  return [
+    {id:1, title:'Welcome to Notes', body:'This is Endroid Notes — auto‑saves as you type. Create a new note with the + button.'},
+    {id:2, title:'Endroid OS ideas', body:'- Tiling window layouts\n- Dark/light auto schedule\n- .epk signature verification'},
+  ];
+}
+function saveNotesData(list){ localStorage.setItem('endroid_notes', JSON.stringify(list)); }
+function renderNotes(body){
+  let notes = loadNotesData();
+  let activeId = notes[0]?.id;
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <button id="nt-new"><i data-lucide="plus"></i></button>
+        <button id="nt-del"><i data-lucide="trash-2"></i></button>
+        <div class="path" style="text-align:right;color:var(--text-2);">${notes.length} notes</div>
+      </div>
+      <div class="notes-split">
+        <div class="notes-list" id="nt-list"></div>
+        <div class="note-edit">
+          <input type="text" id="nt-title" placeholder="Title">
+          <textarea id="nt-body" placeholder="Start typing…"></textarea>
+        </div>
+      </div>
+    </div>
+  `;
+  const list = body.querySelector('#nt-list');
+  const titleEl = body.querySelector('#nt-title');
+  const bodyEl = body.querySelector('#nt-body');
+  function drawList(){
+    list.innerHTML = notes.map(n=>`
+      <div class="note-row ${n.id===activeId?'active':''}" data-id="${n.id}">
+        <div class="nt">${n.title||'Untitled'}</div>
+        <div class="np">${(n.body||'').slice(0,40) || 'No additional text'}</div>
+      </div>`).join('');
+    list.querySelectorAll('.note-row').forEach(r=>{
+      r.onclick = ()=>{ activeId = Number(r.dataset.id); drawList(); loadEditor(); };
+    });
+  }
+  function loadEditor(){
+    const n = notes.find(x=>x.id===activeId);
+    if(!n){ titleEl.value=''; bodyEl.value=''; return; }
+    titleEl.value = n.title; bodyEl.value = n.body;
+  }
+  function persist(){
+    const n = notes.find(x=>x.id===activeId);
+    if(!n) return;
+    n.title = titleEl.value; n.body = bodyEl.value;
+    saveNotesData(notes);
+    drawList();
+  }
+  titleEl.addEventListener('input', persist);
+  bodyEl.addEventListener('input', persist);
+  body.querySelector('#nt-new').onclick = ()=>{
+    const n = {id:Date.now(), title:'Untitled', body:''};
+    notes.unshift(n); activeId = n.id;
+    saveNotesData(notes); drawList(); loadEditor();
+    bodyEl.focus();
+  };
+  body.querySelector('#nt-del').onclick = ()=>{
+    if(!notes.length) return;
+    notes = notes.filter(n=>n.id!==activeId);
+    saveNotesData(notes);
+    activeId = notes[0]?.id;
+    drawList(); loadEditor();
+  };
+  drawList(); loadEditor();
+}
+function renderCalc(body){
+  body.innerHTML = `
+    <div class="calc">
+      <div class="calc-hist" id="c-hist">&nbsp;</div>
+      <div class="calc-disp" id="c-disp">0</div>
+      <div class="calc-grid" id="c-grid"></div>
+    </div>
+  `;
+  const keys = [
+    ['C','fn'],['(',  'fn'],[')','fn'],['÷','op'],
+    ['7',''],['8',''],['9',''],['×','op'],
+    ['4',''],['5',''],['6',''],['−','op'],
+    ['1',''],['2',''],['3',''],['+','op'],
+    ['0',''],['.',''],['⌫','fn'],['=','eq'],
+  ];
+  const grid = body.querySelector('#c-grid');
+  keys.forEach(([label,cls])=>{
+    const b = document.createElement('button');
+    b.className = 'calc-btn '+cls;
+    b.textContent = label;
+    b.style.gridColumn = label==='0' ? '' : '';
+    grid.appendChild(b);
+    b.onclick = ()=>handleKey(label);
+  });
+  const disp = body.querySelector('#c-disp');
+  const hist = body.querySelector('#c-hist');
+  let expr = '';
+  function handleKey(k){
+    if(k==='C'){ expr=''; disp.textContent='0'; hist.textContent='\u00A0'; return; }
+    if(k==='⌫'){ expr = expr.slice(0,-1); disp.textContent = expr || '0'; return; }
+    if(k==='='){
+      try{
+        const safe = expr.replace(/×/g,'*').replace(/÷/g,'/').replace(/−/g,'-');
+        const result = Function('"use strict";return ('+safe+')')();
+        hist.textContent = expr + ' =';
+        expr = String(result);
+        disp.textContent = expr;
+      }catch(e){ disp.textContent='Error'; expr=''; }
+      return;
+    }
+    expr += k;
+    disp.textContent = expr;
+  }
+  document.addEventListener('keydown', function kh(e){
+    if(!document.body.contains(grid)) { document.removeEventListener('keydown', kh); return; }
+  });
+}
+let installedApps = [
+  {name:'Photo Viewer', version:'1.2.0', icon:'image'},
+  {name:'Weather', version:'0.9.4', icon:'cloud-sun'},
+];
+function renderInstaller(body){
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="app-toolbar">
+        <div class="seg" id="inst-tabs" style="flex:1;">
+          <button data-t="epk" class="active">Install .epk</button>
+          <button data-t="store">App Store</button>
+        </div>
+      </div>
+      <div class="content" id="inst-tab-content" style="padding:0;"></div>
+    </div>
+  `;
+  lucide.createIcons();
+  const tabContent = body.querySelector('#inst-tab-content');
+  body.querySelectorAll('#inst-tabs button').forEach(b=>{
+    b.onclick = ()=>{
+      body.querySelectorAll('#inst-tabs button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+      if(b.dataset.t==='epk') drawEpkTab(); else drawStoreTab();
+    };
+  });
+  function drawEpkTab(){
+    tabContent.innerHTML = `
+        <div class="installer-drop" id="inst-drop">
+          <i data-lucide="package-plus"></i>
+          <div class="h">Drop a real .epk package to install</div>
+          <div class="s">Zip archive containing manifest.json + your app's HTML/CSS/JS</div>
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:14px;">
+            <button id="inst-browse">Browse for .epk</button>
+            <button id="inst-sample" style="background:var(--bg-1);border:1px solid var(--line-soft);color:var(--text-1);border-radius:8px;padding:8px 16px;font-size:12.5px;cursor:pointer;font-family:var(--font-body);">Download sample .epk</button>
+          </div>
+        </div>
+        <div style="margin:0 20px 20px;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:12px;padding:16px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+            <i data-lucide="app-window" style="width:15px;height:15px;stroke:var(--accent);"></i>
+            <div style="font-family:var(--font-display);font-weight:600;font-size:13px;color:var(--text-0);">Install a web app</div>
+          </div>
+          <div style="font-size:11.5px;color:var(--text-2);margin-bottom:10px;line-height:1.5;">
+            Paste a manifest — <b style="color:var(--text-1);">name</b> and <b style="color:var(--text-1);">url</b> are required.
+            <b style="color:var(--text-1);">icon</b> can be a Lucide icon name (e.g. "rocket") or raw &lt;svg&gt; markup.
+          </div>
+          <textarea id="wa-manifest" spellcheck="false" style="width:100%;min-height:110px;background:var(--bg-1);border:1px solid var(--line-soft);border-radius:8px;padding:10px;color:var(--text-0);font-family:var(--font-mono);font-size:11.5px;outline:none;resize:vertical;">{
+  "name": "Wikipedia",
+  "url": "https://en.wikipedia.org",
+  "icon": "book-open",
+  "description": "The free encyclopedia"
+}</textarea>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            <button id="wa-install" style="flex:1;background:var(--accent);border:none;border-radius:8px;padding:9px;color:#08110F;font-weight:600;font-size:12.5px;cursor:pointer;font-family:var(--font-body);">Install web app</button>
+            <button id="wa-example" style="background:var(--bg-3);border:1px solid var(--line-soft);border-radius:8px;padding:9px 14px;color:var(--text-1);font-size:12.5px;cursor:pointer;font-family:var(--font-body);">Try SVG example</button>
+          </div>
+          <div id="wa-status" style="font-size:11px;color:var(--text-2);margin-top:8px;"></div>
+        </div>
+        <div class="manifest-box" id="inst-manifest" style="display:none;"></div>
+        <div style="padding:0 20px 6px;font-size:11.5px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.5px;">Installed applications</div>
+        <div class="installed-list" id="inst-list"></div>
+    `;
+    lucide.createIcons();
+    wireEpkTab();
+  }
+  let storeCategory = 'All';
+  function drawStoreTab(){
+    const catalog = window.APP_STORE_CATALOG || [];
+    if(!catalog.length){
+      tabContent.innerHTML = `<div class="empty-state" style="height:220px;"><i data-lucide="store"></i><span>App Store catalog failed to load</span></div>`;
+      lucide.createIcons();
+      return;
+    }
+    const categories = ['All', ...new Set(catalog.map(a=>a.category))];
+    const filtered = storeCategory==='All' ? catalog : catalog.filter(a=>a.category===storeCategory);
+    tabContent.innerHTML = `
+      <div style="padding:14px 20px 10px;font-size:11.5px;color:var(--text-2);">${catalog.length} apps available</div>
+      <div style="display:flex;gap:6px;padding:0 20px 14px;overflow-x:auto;">
+        ${categories.map(c=>`<button data-cat="${c}" class="store-cat-btn" style="flex:0 0 auto;background:${c===storeCategory?'var(--accent)':'var(--bg-2)'};border:1px solid ${c===storeCategory?'var(--accent)':'var(--line-soft)'};border-radius:20px;padding:6px 13px;color:${c===storeCategory?'#08110F':'var(--text-1)'};font-size:11.5px;font-weight:${c===storeCategory?'600':'400'};cursor:pointer;font-family:var(--font-body);white-space:nowrap;">${c}</button>`).join('')}
+      </div>
+      <div style="padding:0 20px 16px;display:flex;flex-direction:column;gap:8px;">
+        ${filtered.map(app=>{
+          const installed = !!APPS['store_'+app.id];
+          return `
+          <div style="display:flex;align-items:center;gap:12px;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:11px;padding:12px 14px;">
+            <div style="width:38px;height:38px;border-radius:10px;background:var(--bg-1);border:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center;flex:0 0 auto;">
+              <i data-lucide="${app.icon}" style="width:17px;height:17px;stroke:var(--accent);"></i>
+            </div>
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:13px;font-weight:600;color:var(--text-0);">${app.name}</div>
+              <div style="font-size:11px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${app.description}</div>
+            </div>
+            <button data-id="${app.id}" class="store-install-btn" ${installed?'disabled':''} style="flex:0 0 auto;background:${installed?'var(--bg-3)':'var(--accent)'};border:${installed?'1px solid var(--line-soft)':'none'};border-radius:8px;padding:8px 14px;color:${installed?'var(--text-2)':'#08110F'};font-weight:600;font-size:12px;cursor:${installed?'default':'pointer'};font-family:var(--font-body);white-space:nowrap;">
+              ${installed?'Installed':'Install'}
+            </button>
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+    lucide.createIcons();
+    tabContent.querySelectorAll('.store-cat-btn').forEach(btn=>{
+      btn.onclick = ()=>{ storeCategory = btn.dataset.cat; drawStoreTab(); };
+    });
+    tabContent.querySelectorAll('.store-install-btn').forEach(btn=>{
+      btn.onclick = ()=>{
+        const app = catalog.find(a=>a.id===btn.dataset.id);
+        if(!app) return;
+        const key = 'store_'+app.id;
+        APPS[key] = { name: app.name, icon: app.icon, pinned:false, render: app.render };
+        installedApps.push({name: app.name, version:'1.0.0', icon: app.icon, appKey: key});
+        addInstalledMeta({type:'store', key, storeId: app.id});
+        rebuildLauncherAndPins();
+        pushNotif(app.icon,'check-circle','App installed', app.name+' was added to your launcher');
+        drawStoreTab();
+      };
+    });
+  }
+  function wireEpkTab(){
+  const list = body.querySelector('#inst-list');
+  function drawList(){
+    list.innerHTML = installedApps.map(a=>`
+      <div class="installed-row">
+        <div class="ico">${iconMarkup(a)}</div>
+        <div class="info"><div class="n">${a.name}</div><div class="v">${a.version?'v'+a.version:(a.url||'')}</div></div>
+        <button class="win-btn" data-name="${a.name}" title="Uninstall"><i data-lucide="trash-2" style="width:14px;height:14px;"></i></button>
+      </div>`).join('');
+    lucide.createIcons();
+    list.querySelectorAll('button[data-name]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const target = installedApps.find(a=>a.name===btn.dataset.name);
+        installedApps = installedApps.filter(a=>a.name!==btn.dataset.name);
+        if(target && target.appKey){ delete APPS[target.appKey]; closeWindow(target.appKey); rebuildLauncherAndPins(); removeInstalledMeta(target.appKey); }
+        drawList();
+        showToast('trash-2','App removed', btn.dataset.name+' was uninstalled');
+      };
+    });
+  }
+  function showManifestPreview(manifest){
+    const manifestBox = body.querySelector('#inst-manifest');
+    manifestBox.style.display='block';
+    manifestBox.textContent = JSON.stringify(manifest, null, 2);
+  }
+  const MIME_MAP = {
+    css:'text/css', js:'application/javascript', mjs:'application/javascript',
+    png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', svg:'image/svg+xml',
+    gif:'image/gif', webp:'image/webp', json:'application/json',
+    woff:'font/woff', woff2:'font/woff2', ttf:'font/ttf', mp3:'audio/mpeg', wav:'audio/wav'
+  };
+  async function installEpkFile(file){
+    if(typeof JSZip === 'undefined'){
+      showToast('alert-triangle','Installer unavailable', 'The .epk reader failed to load — check your connection and try again.');
+      return;
+    }
+    let zip;
+    try{ zip = await JSZip.loadAsync(file); }
+    catch(e){ showToast('alert-triangle','Invalid package', "That file isn't a valid .epk (zip) archive."); return; }
+    const manifestEntry = zip.file('manifest.json');
+    if(!manifestEntry){ showToast('alert-triangle','Missing manifest', 'This .epk has no manifest.json at its root.'); return; }
+    let manifest;
+    try{ manifest = JSON.parse(await manifestEntry.async('text')); }
+    catch(e){ showToast('alert-triangle','Invalid manifest', "manifest.json isn't valid JSON."); return; }
+    if(!manifest.name || !manifest.main){
+      showToast('alert-triangle','Incomplete manifest', '"name" and "main" are required in manifest.json.'); return;
+    }
+    const key = 'epk_' + Date.now();
+    try{
+      const rawBlob = await file.arrayBuffer().then(b=>new Blob([b]));
+      await idbPut(key, rawBlob);
+    }catch(e){ console.warn('Could not persist .epk to IndexedDB', e); }
+    await registerEpkFromZip(zip, manifest, key, true);
+    showManifestPreview(manifest);
+    rebuildLauncherAndPins();
+    drawList();
+    pushNotif('package-check','check-circle','Installation complete', `${manifest.name} was installed from ${file.name}`);
+  }
+  async function registerEpkFromZip(zip, manifest, key, persistMeta){
+    const mainPath = manifest.main.replace(/^\.\//,'').replace(/^\//,'');
+    const mainEntry = zip.file(mainPath) || zip.file(manifest.main);
+    if(!mainEntry){ showToast('alert-triangle','Entry file missing', `Couldn't find "${manifest.main}" inside the package.`); return; }
+    let html = await mainEntry.async('text');
+    const blobMap = {};
+    const paths = Object.keys(zip.files).filter(p => !zip.files[p].dir && p !== mainPath && p !== 'manifest.json');
+    for(const path of paths){
+      const ext = path.split('.').pop().toLowerCase();
+      const mime = MIME_MAP[ext] || 'application/octet-stream';
+      const raw = await zip.files[path].async('blob');
+      const url = URL.createObjectURL(new Blob([raw], {type: mime}));
+      blobMap[path] = url;
+      blobMap[path.replace(/^\.\//,'')] = url;
+    }
+    html = html.replace(/(src|href)=["']([^"']+)["']/g, (m, attr, val)=>{
+      if(/^(https?:)?\/\//i.test(val) || val.startsWith('data:') || val.startsWith('blob:') || val.startsWith('#')) return m;
+      const clean = val.replace(/^\.\//,'').replace(/^\//,'');
+      return blobMap[clean] ? `${attr}="${blobMap[clean]}"` : m;
+    });
+    const htmlUrl = URL.createObjectURL(new Blob([html], {type:'text/html'}));
+    let icon = 'package', svg = null;
+    if(typeof manifest.icon === 'string' && manifest.icon.trim().startsWith('<svg')){
+      svg = manifest.icon.trim();
+    } else if(manifest.icon){
+      icon = resolveIconName(manifest.icon.trim().toLowerCase());
+    }
+    APPS[key] = { name: manifest.name, icon, svg, pinned:false, render: (b)=>renderWebApp(b, htmlUrl) };
+    installedApps.push({name: manifest.name, version: manifest.version || '1.0.0', icon, svg, appKey: key});
+    if(persistMeta) addInstalledMeta({type:'epk', key, manifest});
+  }
+  const drop = body.querySelector('#inst-drop');
+  drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.style.borderColor='var(--accent)'; });
+  drop.addEventListener('dragleave', ()=>{ drop.style.borderColor='var(--line)'; });
+  drop.addEventListener('drop', e=>{
+    e.preventDefault(); drop.style.borderColor='var(--line)';
+    const f = e.dataTransfer.files[0];
+    if(f) installEpkFile(f);
+  });
+  body.querySelector('#inst-browse').onclick = ()=>{
+    const input = document.createElement('input');
+    input.type='file'; input.accept='.epk,.zip';
+    input.onchange = ()=>{ if(input.files[0]) installEpkFile(input.files[0]); };
+    input.click();
+  };
+  body.querySelector('#inst-sample').onclick = async ()=>{
+    if(typeof JSZip === 'undefined'){ showToast('alert-triangle','Unavailable','The zip library failed to load.'); return; }
+    const zip = new JSZip();
+    zip.file('manifest.json', JSON.stringify({
+      name: "Hello Endroid",
+      version: "1.0.0",
+      author: "Endroid",
+      main: "index.html",
+      icon: "sparkles",
+      permissions: []
+    }, null, 2));
+    zip.file('index.html', `<!DOCTYPE html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="style.css"></head>
+<body>
+  <h1>Hello from a real .epk!</h1>
+  <p>This app was unzipped, its manifest parsed, and its files loaded entirely in your browser.</p>
+  <button onclick="document.getElementById('c').textContent = Number(document.getElementById('c').textContent)+1">Click me</button>
+  <p>Clicks: <span id="c">0</span></p>
+</body></html>`);
+    zip.file('style.css', `body{font-family:sans-serif;background:#12151B;color:#EDEFF3;padding:40px;text-align:center;}
+button{background:#4FD1C5;border:none;border-radius:8px;padding:10px 18px;font-size:14px;cursor:pointer;margin-top:16px;}`);
+    const blob = await zip.generateAsync({type:'blob'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'hello-endroid.epk';
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  };
+  const waStatus = body.querySelector('#wa-status');
+  body.querySelector('#wa-example').onclick = ()=>{
+    body.querySelector('#wa-manifest').value = JSON.stringify({
+      name: "Endroid",
+      url: "https://endroid.zone.id",
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="#4FD1C5" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12h8M12 8v8"/></svg>',
+      description: "Endroid brand site"
+    }, null, 2);
+  };
+  body.querySelector('#wa-install').onclick = ()=>{
+    let manifest;
+    try{ manifest = JSON.parse(body.querySelector('#wa-manifest').value); }
+    catch(e){ waStatus.textContent = 'Invalid JSON manifest.'; waStatus.style.color='var(--danger)'; return; }
+    if(!manifest.name || !manifest.url){
+      waStatus.textContent = '"name" and "url" are required fields.'; waStatus.style.color='var(--danger)'; return;
+    }
+    let target = manifest.url;
+    if(!/^https?:\/\//i.test(target)) target = 'https://' + target;
+    const appEntry = { name: manifest.name, pinned:false, render: (b)=>renderWebApp(b, target) };
+    if(typeof manifest.icon === 'string' && manifest.icon.trim().startsWith('<svg')){
+      appEntry.svg = manifest.icon.trim();
+      appEntry.icon = 'app-window';
+    } else {
+      appEntry.icon = resolveIconName((manifest.icon||'').trim().toLowerCase());
+      if(appEntry.icon === 'app-window' && manifest.icon){
+        waStatus.textContent = `Icon "${manifest.icon}" isn't a known Lucide icon — using a default icon instead.`;
+        waStatus.style.color='var(--warn)';
+      } else {
+        waStatus.textContent = '';
+      }
+    }
+    const key = 'web_' + Date.now();
+    APPS[key] = appEntry;
+    installedApps.push({name: manifest.name, url: target, icon: appEntry.icon, svg: appEntry.svg, appKey: key});
+    addInstalledMeta({type:'web', key, name: manifest.name, url: target, icon: appEntry.icon, svg: appEntry.svg});
+    rebuildLauncherAndPins();
+    drawList();
+    pushNotif('app-window','check-circle','Web app installed', manifest.name+' was added to your launcher');
+    if(!waStatus.textContent) waStatus.textContent = 'Installed — find it in the launcher.';
+    if(!waStatus.style.color || waStatus.style.color==='var(--warn)') { if(!waStatus.style.color) waStatus.style.color='var(--accent)'; }
+  };
+  drawList();
+  }
+  drawEpkTab();
+}
+function renderWebApp(body, url){
+  body.innerHTML = `<iframe src="${url}" style="width:100%;height:100%;border:none;background:#fff;" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>`;
+}
+function rebuildLauncherAndPins(){
+  buildLauncher(document.getElementById('launcher-input')?.value || '');
+}
+function renderTerminal(body){
+  body.innerHTML = `<div class="term" id="term-out"></div>`;
+  const out = body.querySelector('#term-out');
+  const cwd = '~';
+  function printLine(html){
+    const l = document.createElement('div');
+    l.className='term-line';
+    l.innerHTML = html;
+    out.appendChild(l);
+    out.scrollTop = out.scrollHeight;
+  }
+  function newPrompt(){
+    const row = document.createElement('div');
+    row.className='term-input-row';
+    row.innerHTML = `<span class="term-prompt">endroid@device:${cwd}$</span><input type="text" autocomplete="off" spellcheck="false">`;
+    out.appendChild(row);
+    const input = row.querySelector('input');
+    input.focus();
+    input.addEventListener('keydown', e=>{
+      if(e.key==='Enter'){
+        const cmd = input.value.trim();
+        row.remove();
+        printLine(`<span class="term-prompt">endroid@device:${cwd}$</span> ${escapeHtml(cmd)}`);
+        runCmd(cmd);
+        newPrompt();
+      }
+    });
+  }
+  function escapeHtml(s){ return s.replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+  function runCmd(cmd){
+    const [c, ...args] = cmd.split(' ');
+    switch(c){
+      case '': break;
+      case 'help':
+        printLine('Available commands: help, ls, whoami, date, echo, neofetch, clear, uname, version'); break;
+      case 'ls':
+        printLine('Documents  Downloads  Pictures  Projects'); break;
+      case 'whoami':
+        printLine('wized1'); break;
+      case 'date':
+        printLine(new Date().toString()); break;
+      case 'echo':
+        printLine(escapeHtml(args.join(' '))); break;
+      case 'uname':
+        printLine('Endroid OS 1.0.0 (Linux kernel, web runtime)'); break;
+      case 'version':
+        printLine('Endroid OS v1.0.0 — build 2026.08'); break;
+      case 'neofetch':
+        printLine(`<span style="color:var(--accent)">endroid@device</span>
+-------------
+OS: Endroid OS 1.0.0
+Kernel: Linux (custom, &lt;15MB)
+Runtime: WebKitGTK
+Shell: endroid-sh
+Memory: 187MB / 256MB
+Storage: 412MB / 500MB`); break;
+      case 'clear':
+        out.innerHTML=''; break;
+      default:
+        printLine(`command not found: ${escapeHtml(c)}`);
+    }
+  }
+  printLine('Endroid OS Terminal — type <b style="color:var(--text-0)">help</b> for a list of commands.');
+  newPrompt();
+}
+const accentPalette = [
+  {name:'teal', val:'#4FD1C5', dim:'#2C8A80'},
+  {name:'blue', val:'#5B9EE8', dim:'#3A6FA8'},
+  {name:'violet', val:'#A48CE6', dim:'#6E5AA8'},
+  {name:'amber', val:'#E8A33D', dim:'#A8752A'},
+  {name:'rose', val:'#E87DA0', dim:'#A8556F'},
+];
+let currentAccent = localStorage.getItem('endroid_accent') || '#4FD1C5';
+function applyAccent(hex, dim){
+  currentAccent = hex;
+  document.body.style.setProperty('--accent', hex);
+  document.body.style.setProperty('--accent-dim', dim);
+  document.body.style.setProperty('--accent-glow', hex+'2E');
+  localStorage.setItem('endroid_accent', hex);
+  localStorage.setItem('endroid_accent_dim', dim);
+}
+(function initAccent(){
+  const dim = localStorage.getItem('endroid_accent_dim');
+  if(localStorage.getItem('endroid_accent') && dim) applyAccent(currentAccent, dim);
+})();
+function renderSettings(body){
+  const theme = document.body.dataset.theme;
+  body.innerHTML = `
+    <div class="app-pane">
+      <div class="split" style="height:100%;">
+        <div class="sidebar">
+          <div class="side-item active" data-p="appearance"><i data-lucide="palette"></i>Appearance</div>
+          <div class="side-item" data-p="network"><i data-lucide="wifi"></i>Network</div>
+          <div class="side-item" data-p="sound"><i data-lucide="volume-2"></i>Sound</div>
+          <div class="side-item" data-p="apps"><i data-lucide="layout-grid"></i>Applications</div>
+          <div class="side-item" data-p="about"><i data-lucide="info"></i>About</div>
+        </div>
+        <div class="content" id="set-content" style="flex:1;"></div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  const content = body.querySelector('#set-content');
+  const panels = {
+    appearance: ()=>`
+      <div class="settings-content">
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="sun-moon"></i>Theme</div>
+          <div class="seg" id="theme-seg">
+            <button data-t="dark" class="${theme==='dark'?'active':''}">Dark</button>
+            <button data-t="light" class="${theme==='light'?'active':''}">Light</button>
+          </div>
+        </div>
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="droplet"></i>Accent colour</div>
+          <div class="swatch-row" id="accent-row"></div>
+        </div>
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="accessibility"></i>Accessibility</div>
+          <div class="set-row"><div><div class="lbl">Reduce motion</div><div class="sub">Minimise animations across the system</div></div><div class="toggle" id="reduce-motion"><div class="knob"></div></div></div>
+        </div>
+      </div>`,
+    network: ()=>`
+      <div class="settings-content">
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="wifi"></i>Wi‑Fi</div>
+          <div class="set-row"><div><div class="lbl">Endroid_Home5G</div><div class="sub">Connected · Secured</div></div><i data-lucide="check-circle" style="width:16px;height:16px;stroke:var(--accent);"></i></div>
+          <div class="set-row"><div><div class="lbl">CoffeeShop_Guest</div><div class="sub">Available</div></div></div>
+        </div>
+      </div>`,
+    sound: ()=>`
+      <div class="settings-content">
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="volume-2"></i>Volume</div>
+          <div class="set-row"><div class="lbl">Master volume</div><input type="range" value="70" style="accent-color:var(--accent);"></div>
+          <div class="set-row"><div><div class="lbl">System sounds</div><div class="sub">Play sound on notifications</div></div><div class="toggle on"><div class="knob"></div></div></div>
+        </div>
+      </div>`,
+    apps: ()=>`
+      <div class="settings-content">
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="layout-grid"></i>Installed applications</div>
+          ${installedApps.map(a=>`<div class="set-row"><div class="lbl">${a.name}</div><div class="sub">v${a.version}</div></div>`).join('')}
+        </div>
+      </div>`,
+    about: ()=>`
+      <div class="settings-content">
+        <div class="set-section">
+          <div class="set-h"><i data-lucide="box"></i>Endroid OS</div>
+          <div class="set-row"><div class="lbl">Version</div><div class="sub" style="text-align:right;">1.0.0 (build 2026.08)</div></div>
+          <div class="set-row"><div class="lbl">Kernel</div><div class="sub" style="text-align:right;">Linux, custom‑compiled</div></div>
+          <div class="set-row"><div class="lbl">Runtime</div><div class="sub" style="text-align:right;">WebKitGTK</div></div>
+          <div class="set-row"><div class="lbl">Storage used</div><div class="sub" style="text-align:right;">412 MB / 500 MB</div></div>
+        </div>
+      </div>`,
+  };
+  function draw(p){
+    content.innerHTML = panels[p]();
+    lucide.createIcons();
+    if(p==='appearance'){
+      content.querySelectorAll('#theme-seg button').forEach(b=>{
+        b.onclick = ()=>{
+          document.body.dataset.theme = b.dataset.t;
+          content.querySelectorAll('#theme-seg button').forEach(x=>x.classList.remove('active'));
+          b.classList.add('active');
+        };
+      });
+      const row = content.querySelector('#accent-row');
+      accentPalette.forEach(c=>{
+        const sw = document.createElement('div');
+        sw.className='swatch'+(currentAccent.toLowerCase()===c.val.toLowerCase()?' active':'');
+        sw.style.background = c.val;
+        sw.title = c.name;
+        sw.onclick = ()=>{ applyAccent(c.val, c.dim); row.querySelectorAll('.swatch').forEach(s=>s.classList.remove('active')); sw.classList.add('active'); };
+        row.appendChild(sw);
+      });
+      const rm = content.querySelector('#reduce-motion');
+      rm.onclick = ()=>rm.classList.toggle('on');
+    }
+  }
+  body.querySelectorAll('.side-item').forEach(s=>{
+    s.onclick = ()=>{
+      body.querySelectorAll('.side-item').forEach(x=>x.classList.remove('active'));
+      s.classList.add('active');
+      draw(s.dataset.p);
+    };
+  });
+  draw('appearance');
+}
+document.addEventListener('dragstart', e=>{ if(e.target.closest('#taskbar,#desktop-icons')) e.preventDefault(); });
+
