@@ -1,8 +1,39 @@
 ```
-# Build artifacts
-endroid-os-build/endroid-os-installed.img
-```node_modules/
-.next/
-dist/
-build/
+# Build artifacts and ISO files
+endroid-os-build/endroid-os-installer.iso
+endroid-os-build/iso_root/
+endroid-os-build/initrd.gz
+endroid-os-build/iso_root/boot/bzImage
+
+# Screenshots
+endroid-os-build/screenshots/
+
+# Temporary build files
+*.tmp
 *.log
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+```

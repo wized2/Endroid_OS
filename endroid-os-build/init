@@ -1,0 +1,22 @@
+#!/bin/busybox sh
+busybox mkdir -p /dev /proc /sys /mnt /data/system /data/apps /data/user
+busybox mount -t proc proc /proc
+busybox mount -t sysfs sys /sys
+busybox mount -t devtmpfs dev /dev
+
+# Check if we're in install mode
+if grep -q "install" /proc/cmdline; then
+    echo "Starting installer..."
+    exec /usr/bin/installer.sh
+fi
+
+# Mount squashfs root (simulated for demo)
+busybox mkdir -p /root
+busybox mount -t tmpfs root /root
+
+# Mount data partition (simulated as tmpfs for ISO demo)
+busybox mount -t tmpfs data /data
+
+# Start browser with UI (simulated with simple HTTP server)
+cd /usr/share/endroid
+exec busybox httpd -f -p 80 -h .
