@@ -1,0 +1,61 @@
+BR2_EXTERNAL_ENDROID_PATH=$(pwd)/br2-external
+
+# Target architecture - x86_64 for QEMU and most modern hardware
+BR2_x86_64=y
+
+# Kernel headers
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_6=y
+
+# System configuration
+BR2_TARGET_GENERIC_HOSTNAME="endroid"
+BR2_TARGET_GENERIC_ISSUE="Endroid OS"
+BR2_ROOTFS_POST_IMAGE_SCRIPT=y
+BR2_ROOTFS_POST_SCRIPT_ARGS=""
+
+# Init system - using s6 for minimal footprint
+BR2_INIT_NONE=y
+BR2_PACKAGE_S6_RC=y
+BR2_PACKAGE_S6_PORTABLE_UTILS=y
+
+# Essential system tools
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_PACKAGE_UTIL_LINUX=y
+BR2_PACKAGE_UTIL_LINUX_LSblk=y
+BR2_PACKAGE_UTIL_LINUX_MOUNT=y
+BR2_PACKAGE_UTIL_LINUX_UMOUNT=y
+BR2_PACKAGE_E2FSPROGS=y
+BR2_PACKAGE_DOSFSTOOLS=y
+
+# D-Bus (required for hardware services)
+BR2_PACKAGE_DBUS=y
+BR2_PACKAGE_DBUS_TOOLS=y
+
+# Network management - connman for minimal footprint
+BR2_PACKAGE_CONNMAN=y
+BR2_PACKAGE_CONNMAN_CLIENT=y
+
+# Graphics/display stack
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
+BR2_PACKAGE_MESA3D_OPENGL_EGL=y
+
+# WebKitGTK + cog browser launcher
+BR2_PACKAGE_WPEWEBKIT=y
+BR2_PACKAGE_COG=y
+
+# Custom daemon package
+BR2_PACKAGE_ENDROIDD=y
+
+# Filesystem support
+BR2_EXT4=y
+BR2_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS=y
+
+# Disable unnecessary features for size
+BR2_USE_MMU=y
+BR2_TOOLCHAIN_BUILDROOT_LIBC="musl"
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+
+# Optimization for size
+BR2_OPTIMIZE_SIZE=y
+BR2_FORTIFY_SOURCE_NONE=y

@@ -1,0 +1,8 @@
+```
+# Build artifacts
+endroid-os-build/endroid-os-installed.img
+```node_modules/
+.next/
+dist/
+build/
+*.log
