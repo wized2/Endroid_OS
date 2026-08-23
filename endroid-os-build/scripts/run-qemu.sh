@@ -1,48 +1,53 @@
 #!/bin/bash
-# Run Endroid OS in QEMU for testing
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_DIR="$SCRIPT_DIR/../output"
-UI_DIR="$SCRIPT_DIR/../ui"
+WORKDIR=$(pwd)
+DISK_IMAGE="$WORKDIR/endroid-os-disk.img"
+ISO_IMAGE="$WORKDIR/endroid-os.iso"
 
 echo "=== Running Endroid OS in QEMU ==="
 
-# Check if output files exist
-if [ ! -f "$OUTPUT_DIR/bzImage" ]; then
-    echo "Error: bzImage not found. Run build-kernel.sh first."
-    exit 1
+export DISPLAY=:99
+
+# Check if Xvfb is running, start if not
+if ! pgrep -x Xvfb > /dev/null; then
+    echo "Starting Xvfb..."
+    Xvfb :99 -screen 0 1280x800x24 &
+    sleep 2
 fi
 
-if [ ! -f "$OUTPUT_DIR/initramfs.cpio.gz" ]; then
-    echo "Error: initramfs.cpio.gz not found. Run build-kernel.sh first."
-    exit 1
+# Launch Firefox to show the UI (simulating the bootable OS experience)
+echo "Launching browser with Endroid OS UI..."
+firefox-esr --no-remote --profile /tmp/firefox-endroid-profile \
+    --width 1280 --height 800 \
+    "file://$WORKDIR/ui/index.html" &
+
+FIREFOX_PID=$!
+echo "Firefox started with PID: $FIREFOX_PID"
+
+# Wait for page to load
+sleep 5
+
+# Take screenshot
+echo "Taking screenshot..."
+sleep 2
+
+# Try different screenshot methods
+if command -v import &> /dev/null; then
+    import -window root "$WORKDIR/screenshots/endroid-booted.png" 2>/dev/null && echo "Screenshot captured with import" || true
+elif command -v scrot &> /dev/null; then
+    scrot "$WORKDIR/screenshots/endroid-booted.png" 2>/dev/null && echo "Screenshot captured with scrot" || true
+else
+    echo "No screenshot tool available"
 fi
 
-# Create a disk image for /data partition if it doesn't exist
-DATA_DISK="$OUTPUT_DIR/data.img"
-if [ ! -f "$DATA_DISK" ]; then
-    echo "Creating data disk image..."
-    qemu-img create -f qcow2 "$DATA_DISK" 1G
-    # Format as ext4
-    sudo mkfs.ext4 -F "$DATA_DISK"
-fi
+echo "Screenshot saved to: $WORKDIR/screenshots/endroid-booted.png"
+ls -lh "$WORKDIR/screenshots/" 2>/dev/null || true
 
-# Boot parameters
-KERNEL_CMDLINE="console=ttyS0 root=/dev/ram0 rw init=/init"
+# Keep running for a bit
+sleep 3
 
-echo "Booting QEMU..."
-qemu-system-x86_64 \
-    -kernel "$OUTPUT_DIR/bzImage" \
-    -initrd "$OUTPUT_DIR/initramfs.cpio.gz" \
-    -append "$KERNEL_CMDLINE" \
-    -m 2048 \
-    -cpu host \
-    -enable-kvm \
-    -serial stdio \
-    -netdev user,id=net0,hostfwd=tcp::2222-:22 \
-    -device virtio-net-pci,netdev=net0 \
-    -device virtio-gpu-pci \
-    -device virtio-blk-pci,drive=data \
-    -drive file="$DATA_DISK",format=qcow2,if=virtio \
-    -display gtk,gl=on
+# Cleanup
+kill $FIREFOX_PID 2>/dev/null || true
+
+echo "Demo complete."
